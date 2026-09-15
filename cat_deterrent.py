@@ -38,9 +38,9 @@ from gpiozero import MotionSensor, OutputDevice
 # --- ピンアサイン（BCM番号）---
 PIR_PIN = 18     # 人感センサー OUT (GPIO 18 / 12番ピン)
 RELAY_PIN = 17   # リレーモジュール IN (GPIO 17 / 11番ピン)
-BUZZER_PIN = 4   # アクティブブザー I/O (GPIO 4 / 7番ピン)
-                 # ※GPIO0〜8はデフォルトが内部プルアップ=起動時からHIGH。
-                 #   ローレベルトリガのブザーが起動中に鳴らないよう、この範囲のピンを使う。
+BUZZER_PIN = 27  # アクティブブザー I/O (GPIO 27 / 13番ピン)
+                 # ※起動直後(アプリ未起動)の誤鳴きを防ぐため、/boot/firmware/config.txt に
+                 #   「gpio=27=op,dh」を追記し、起動時からピンをHIGH(=静音)に固定すること。
 
 # --- タイミング（秒）---
 BEEP_DURATION = 1.0      # ビープを鳴らす長さ
@@ -65,8 +65,11 @@ MAX_PUMP_ON_SEC = 20
 # リレー: 標準はactive_high=True（信号HIGHでON）。
 #   ローアクティブ基板なら active_high=False に変更してください。
 RELAY_ACTIVE_HIGH = True
-# ブザー: 購入品はローレベルトリガ（信号LOWで鳴る）なので active_high=False。
-#   active_high=False + initial_value=False で「.on()で鳴り .off()で止まる」直感的な動作になります。
+# ブザー: ローレベルトリガ（信号LOWで鳴る）なので active_high=False。
+#   ★重要: このモジュールは必ず 3.3V で駆動すること（VCC → Piの3.3Vピン）。
+#     5Vで駆動すると、GPIOのHIGH(3.3V)ではOFFにしきれず鳴り続ける（電圧ミスマッチ）。
+#     3.3V駆動なら「HIGH=完全OFF」となり正常に動作する。
+#   active_high=False + initial_value=False で off=HIGH=静音／.on()=LOW=鳴る、となります。
 BUZZER_ACTIVE_HIGH = False
 
 # --- Webサーバー ---
