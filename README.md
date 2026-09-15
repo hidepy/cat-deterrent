@@ -33,9 +33,10 @@ Raspberry Pi を使った**猫撃退システム**。PIRセンサーで動体を
 |---|---|---|
 | PIRセンサー OUT | GPIO 18 | 12番ピン |
 | リレー IN | GPIO 17 | 11番ピン |
-| ブザー I/O | GPIO 27 | 13番ピン |
+| ブザー I/O | GPIO 4 | 7番ピン |
 
-- ブザーは Pi の GPIO に直結可能（VCC=5V、GND=GND、I/O=GPIO27）。ローレベルトリガのため、コード内では `active_high=False` で扱っています。
+- ブザーは Pi の GPIO に直結可能（VCC=5V、GND=GND、I/O=GPIO4）。ローレベルトリガのため、コード内では `active_high=False` で扱っています。
+- ブザーに **GPIO 4**（＝BCM 0〜8 の範囲）を使うのは、これらのピンが**デフォルトで内部プルアップ＝起動直後からHIGH**のため。ローレベルトリガのブザーが**起動中に鳴りっぱなしになるのを防ぎます**（GPIO 9〜27 はデフォルト・プルダウン＝LOW のため不向き）。
 - リレーは標準の `active_high=True` を想定。ローアクティブ基板の場合は `RELAY_ACTIVE_HIGH = False` に変更してください。
 
 ---

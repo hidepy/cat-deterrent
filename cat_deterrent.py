@@ -38,7 +38,9 @@ from gpiozero import MotionSensor, OutputDevice
 # --- ピンアサイン（BCM番号）---
 PIR_PIN = 18     # 人感センサー OUT (GPIO 18 / 12番ピン)
 RELAY_PIN = 17   # リレーモジュール IN (GPIO 17 / 11番ピン)
-BUZZER_PIN = 27  # アクティブブザー I/O (GPIO 27 / 13番ピン)
+BUZZER_PIN = 4   # アクティブブザー I/O (GPIO 4 / 7番ピン)
+                 # ※GPIO0〜8はデフォルトが内部プルアップ=起動時からHIGH。
+                 #   ローレベルトリガのブザーが起動中に鳴らないよう、この範囲のピンを使う。
 
 # --- タイミング（秒）---
 BEEP_DURATION = 1.0      # ビープを鳴らす長さ
