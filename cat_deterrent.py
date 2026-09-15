@@ -23,6 +23,8 @@ Webアプリ（Flask）から以下の3状態を制御できます:
 import os
 import json
 import time
+import signal
+import atexit
 import threading
 from datetime import datetime, timedelta
 from collections import deque
@@ -45,6 +47,17 @@ SPRAY_DURATION = 4.0     # 散水（リレーON）の長さ
 COOLDOWN = 5.0           # 散水後のクールタイム（この間は再検知しても無視）
 PAUSE_DURATION = 5 * 60  # 「一時OFF」の停止時間（5分）
 TEST_PUMP_DURATION = 5.0 # テストポンプ（呼び水・動作確認用）の駆動時間
+
+# --- 安全機構 ---
+# 暴走検知：直近RUNAWAY_WINDOW秒で自動散水がRUNAWAY_MAX回以上 → 故障モードにラッチ。
+#   （1サイクル最短≒11秒＝最大でも約6回/分なので、6回は「その1分ずっと反応し続けた」異常状態）
+#   ※手動のテストポンプ（呼び水）はこの回数に含めない。
+RUNAWAY_MAX = 6
+RUNAWAY_WINDOW = 60
+# 最大ON時間ウォッチドッグ：リレーが連続でこの秒数を超えてONなら強制OFF＆故障モード。
+#   （"散水が規定秒で切れない"バグ・不具合への別レイヤー保険。実際の上限は下記の通り
+#     正規の最長駆動＝散水/テストポンプより十分大きい値に自動調整される）
+MAX_PUMP_ON_SEC = 20
 
 # --- ハードウェアの極性 ---
 # リレー: 標準はactive_high=True（信号HIGHでON）。
@@ -80,6 +93,33 @@ relay = OutputDevice(RELAY_PIN, active_high=RELAY_ACTIVE_HIGH, initial_value=Fal
 buzzer = OutputDevice(BUZZER_PIN, active_high=BUZZER_ACTIVE_HIGH, initial_value=False)
 
 
+# --- リレー操作の一元化（ON時刻を記録し、最大ON時間ウォッチドッグで監視する）---
+_relay_lock = threading.Lock()
+_relay_on_since = None  # リレーをONにした時刻（monotonic）。OFF中はNone
+
+
+def relay_on():
+    global _relay_on_since
+    with _relay_lock:
+        relay.on()
+        _relay_on_since = time.monotonic()
+
+
+def relay_off():
+    global _relay_on_since
+    with _relay_lock:
+        relay.off()
+        _relay_on_since = None
+
+
+def relay_on_seconds():
+    """リレーが連続ONになっている秒数（OFF中は0）。"""
+    with _relay_lock:
+        if _relay_on_since is None:
+            return 0.0
+        return time.monotonic() - _relay_on_since
+
+
 # ============================================================
 #  システム状態
 # ============================================================
@@ -95,6 +135,9 @@ class SystemState:
         self.spray_count = 0        # 散水回数（起動後）
         self.busy = False           # ビープ〜散水シーケンス実行中か
         self.logs = deque(maxlen=30)  # 直近のログ
+        self.fault = False          # 故障モード（自動散水を停止・ラッチ）
+        self.fault_reason = ""      # 故障モードに入った理由
+        self.spray_times = deque()  # 自動散水のmonotonic時刻（暴走検知用・手動は含めない）
 
     def log(self, message):
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -208,6 +251,36 @@ def read_cpu_temp():
         return None
 
 
+# --- 安全機構：故障モードと最大ON時間ウォッチドッグ ---------------------
+def enter_fault(reason):
+    """故障モードに入る（自動散水を停止しラッチ）。ポンプ・ブザーも即停止。"""
+    with state.lock:
+        if state.fault:
+            return  # 既に故障モードなら二重には入らない
+        state.fault = True
+        state.fault_reason = reason
+    relay_off()
+    buzzer.off()
+    state.log(f"🚨 故障モード: {reason}（自動散水を停止。ONで解除）")
+    log_event("fault", reason=reason)
+
+
+def _max_pump_on_cap():
+    """最大ON時間の実効上限。正規の最長駆動より必ず大きくする（誤発動防止）。"""
+    return max(MAX_PUMP_ON_SEC, SPRAY_DURATION + 3, TEST_PUMP_DURATION + 3)
+
+
+def watchdog_loop():
+    """リレーが実効上限を超えて連続ONなら強制停止＆故障モード。
+    ソフトのバグやハングで"切れない"事態への最後のソフト保険。"""
+    cap = _max_pump_on_cap()
+    while not shutdown_event.is_set():
+        if relay_on_seconds() > cap:
+            relay_off()
+            enter_fault(f"リレーが{cap:.0f}秒を超えて連続ON（強制停止）")
+        time.sleep(0.5)
+
+
 # --- 起動時の復元（ファイルからWebUIの表示を取り戻す）-----------------
 EVENT_LABEL = {
     "startup": "起動しました",
@@ -286,8 +359,8 @@ def run_spray_sequence():
     """検知時の一連の動作。修正依頼3の順序を厳守。"""
     with state.lock:
         # シーケンス直前に念のため状態を再確認
-        # （OFF/一時OFF、あるいはテストポンプ駆動中(busy)なら中止）
-        if state.mode != "ON" or shutdown_event.is_set() or state.busy:
+        # （OFF/一時OFF、故障モード、あるいはテストポンプ駆動中(busy)なら中止）
+        if state.mode != "ON" or shutdown_event.is_set() or state.busy or state.fault:
             return
         state.busy = True
         state.last_motion = datetime.now()
@@ -303,9 +376,9 @@ def run_spray_sequence():
         time.sleep(WAIT_AFTER_BEEP)
 
         state.log("💧 散水開始")
-        relay.on()
+        relay_on()
         time.sleep(SPRAY_DURATION)
-        relay.off()
+        relay_off()
         state.log("散水終了 → クールタイム")
 
         with state.lock:
@@ -313,10 +386,20 @@ def run_spray_sequence():
             state.spray_count += 1
         stats.incr("sprays")
         log_event("spray", duration=SPRAY_DURATION)
+
+        # --- 暴走検知（直近RUNAWAY_WINDOW秒の自動散水回数。手動テストは含めない）---
+        now_m = time.monotonic()
+        with state.lock:
+            state.spray_times.append(now_m)
+            while state.spray_times and now_m - state.spray_times[0] > RUNAWAY_WINDOW:
+                state.spray_times.popleft()
+            count = len(state.spray_times)
+        if count >= RUNAWAY_MAX:
+            enter_fault(f"直近{RUNAWAY_WINDOW}秒で自動散水{count}回（暴走を検知）")
     finally:
         # どんな経路でも必ず停止させる（安全側）
         buzzer.off()
-        relay.off()
+        relay_off()
         with state.lock:
             state.busy = False
 
@@ -325,18 +408,18 @@ def run_test_pump():
     """テスト/呼び水用にポンプ(リレー)だけを一定時間回す。ビープ・検知とは独立。
     散水シーケンスやテスト同士がぶつからないよう busy で排他制御する。"""
     with state.lock:
-        if state.busy or shutdown_event.is_set():
-            return  # 既に何か動作中なら何もしない
+        if state.busy or shutdown_event.is_set() or state.fault:
+            return  # 既に何か動作中／故障モードなら何もしない
         state.busy = True
     try:
         state.log(f"💧 テストポンプ駆動（{TEST_PUMP_DURATION:.0f}秒・Web操作）")
-        log_event("test_pump", duration=TEST_PUMP_DURATION)  # ※散水件数(sprays)には数えない
-        relay.on()
+        log_event("test_pump", duration=TEST_PUMP_DURATION)  # ※散水件数(sprays)・暴走検知には含めない
+        relay_on()
         time.sleep(TEST_PUMP_DURATION)
-        relay.off()
+        relay_off()
         state.log("テストポンプ停止")
     finally:
-        relay.off()
+        relay_off()
         with state.lock:
             state.busy = False
 
@@ -364,6 +447,7 @@ def monitoring_loop():
         # --- 一時OFFの自動復帰チェック ---
         with state.lock:
             mode = state.mode
+            fault = state.fault
             if mode == "PAUSED" and state.pause_until is not None:
                 if datetime.now() >= state.pause_until:
                     state.mode = "ON"
@@ -379,12 +463,12 @@ def monitoring_loop():
             stats.incr("resumes")
             log_event("resume", reason="auto")
 
-        # --- ON状態だった時間だけ稼働時間として加算 ---
-        if mode == "ON":
+        # --- ON かつ 故障モードでない時間だけ稼働時間として加算 ---
+        if mode == "ON" and not fault:
             armed_local += elapsed
 
-        # --- ON かつ クールタイム外なら検知を評価 ---
-        if mode == "ON" and now_mono >= cooldown_until:
+        # --- ON・故障でない・クールタイム外なら検知を評価 ---
+        if mode == "ON" and not fault and now_mono >= cooldown_until:
             if pir.motion_detected:
                 run_spray_sequence()
                 cooldown_until = time.monotonic() + COOLDOWN
@@ -403,7 +487,7 @@ def monitoring_loop():
     stats.add_armed(armed_local)
     stats.flush()
     buzzer.off()
-    relay.off()
+    relay_off()
 
 
 # ============================================================
@@ -491,10 +575,14 @@ async function refresh() {
     const r = await fetch('/api/status');
     const s = await r.json();
     const el = document.getElementById('status');
-    el.className = 'status ' + (s.mode === 'ON' ? 'on' : 'paused');
-    if (s.mode === 'ON') {
+    if (s.fault) {
+      el.className = 'status off';
+      el.innerHTML = '🚨 故障モード<small>' + (s.fault_reason || '異常を検知') + '<br>安全のため自動散水を停止中。ONを押すと解除します</small>';
+    } else if (s.mode === 'ON') {
+      el.className = 'status on';
       el.innerHTML = '稼働中 🟢' + (s.busy ? '<small>動作中...</small>' : '<small>監視しています</small>');
     } else {
+      el.className = 'status paused';
       el.innerHTML = '一時停止中 🟡<small>あと約 ' + s.pause_remaining + ' で自動復帰</small>';
     }
     document.getElementById('last_motion').textContent = s.last_motion || '-';
@@ -518,7 +606,12 @@ async function testPump() {
   const btn = document.getElementById('btn-test');
   try {
     const r = await (await fetch('/api/test_pump', { method: 'POST' })).json();
-    if (!r.ok) { alert('他の動作中のため、いま実行できません。少し待ってからどうぞ。'); return; }
+    if (!r.ok) {
+      alert(r.reason === 'fault'
+        ? '故障モード中は実行できません。先にONを押して解除してください。'
+        : '他の動作中のため、いま実行できません。少し待ってからどうぞ。');
+      return;
+    }
     // 駆動中はボタンを無効化してカウントダウン表示
     let remain = Math.round(r.duration);
     btn.disabled = true; btn.style.opacity = .6;
@@ -563,6 +656,8 @@ def api_status():
         data = {
             "mode": state.mode,
             "busy": state.busy,
+            "fault": state.fault,
+            "fault_reason": state.fault_reason,
             "pause_remaining": remaining,
             "last_motion": _fmt(state.last_motion),
             "last_spray": _fmt(state.last_spray),
@@ -579,12 +674,16 @@ def api_status():
 def api_on():
     with state.lock:
         was_paused = state.mode == "PAUSED"
+        was_fault = state.fault
         state.mode = "ON"
         state.pause_until = None
-    state.log("🟢 ONにしました（Web操作）")
+        state.fault = False           # 故障モードを解除
+        state.fault_reason = ""
+        state.spray_times.clear()     # 暴走カウンタもリセット
+    state.log("🟢 ONにしました（Web操作）" + ("／故障モードを解除" if was_fault else ""))
     if was_paused:
         stats.incr("resumes")
-    log_event("on", source="web")
+    log_event("on", source="web", cleared_fault=was_fault)
     return jsonify({"ok": True})
 
 
@@ -611,7 +710,7 @@ def api_off():
         shutdown_event.set()
         stats.flush()   # 集計を確実に保存してから落とす
         buzzer.off()
-        relay.off()
+        relay_off()
         os._exit(0)
 
     threading.Thread(target=_shutdown, daemon=True).start()
@@ -621,6 +720,8 @@ def api_off():
 @app.route("/api/test_pump", methods=["POST"])
 def api_test_pump():
     with state.lock:
+        if state.fault:
+            return jsonify({"ok": False, "reason": "fault"})
         if state.busy:
             return jsonify({"ok": False, "reason": "busy"})
     # バックグラウンドで駆動し、レスポンスは即返す
@@ -801,15 +902,35 @@ def main():
     print(f"  Web操作: http://<このPiのIP>:{PORT}/ にアクセス")
     print("=" * 50)
 
+    # 終了時に必ずポンプ・ブザーを止めるための保険（異常終了・systemd停止など）
+    def _cleanup_gpio():
+        try:
+            relay_off()
+            buzzer.off()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_gpio)
+
+    def _on_sigterm(signum, frame):
+        # systemctl stop 等で送られるSIGTERMを拾い、確実に停止してから終了
+        state.log("SIGTERM 受信：安全に停止します")
+        shutdown_event.set()
+        stats.flush()
+        _cleanup_gpio()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     # 新しい起動イベントを記録する前に、前回までのログを復元
     restore_from_log()
 
     stats.incr("startups")
     log_event("startup")
 
-    # 監視スレッド開始
-    monitor = threading.Thread(target=monitoring_loop, daemon=True)
-    monitor.start()
+    # 監視スレッド・安全ウォッチドッグを開始
+    threading.Thread(target=monitoring_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
     try:
         # reloader/デバッガはスレッド二重起動やGPIO競合の原因になるため無効化
@@ -819,7 +940,7 @@ def main():
     finally:
         shutdown_event.set()
         buzzer.off()
-        relay.off()
+        relay_off()
         time.sleep(0.2)
 
 
