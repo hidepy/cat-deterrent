@@ -1,0 +1,18 @@
+[Unit]
+Description=Cat Deterrent System (PIR + Relay + Buzzer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ポート80とGPIOを使うため root で実行（環境に合わせて調整可）
+User=root
+WorkingDirectory=/home/pi/ai-agents/cat_system
+ExecStart=/usr/bin/python3 /home/pi/ai-agents/cat_system/cat_deterrent.py
+# Webの「OFF」はos._exit(0)＝正常終了。on-failureなら「OFF」でちゃんと止まり、
+# 異常クラッシュ時だけ自動復帰します。
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
