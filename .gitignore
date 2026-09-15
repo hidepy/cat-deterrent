@@ -3,6 +3,9 @@ stats.json
 events.jsonl
 *.tmp
 
+# === ローカル専用（公開しない）===
+test_sensor.py
+
 # === Python ===
 __pycache__/
 *.py[cod]

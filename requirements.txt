@@ -1,4 +1,0 @@
-flask
-gpiozero
-# Raspberry Pi OS (Bookworm以降) では lgpio がバックエンドとして推奨です
-lgpio

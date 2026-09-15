@@ -1,0 +1,7 @@
+# 改行コードを自動正規化（リポジトリ内は LF に統一）
+* text=auto
+
+# Linux(Pi)上で実行するファイルは常に LF で取り出す
+*.py      text eol=lf
+*.service text eol=lf
+*.sh      text eol=lf
