@@ -12,7 +12,7 @@ Raspberry Pi を使った**猫撃退システム**。PIRセンサーで動体を
 - **撮影**（USBカメラ・任意）：検知の瞬間と散水の瞬間の2枚をJPEG圧縮して `photos/` に保存。カメラが無くても散水は通常どおり動作
 - **Web UI**（スマホ対応）：`ON` / `一時OFF`（5分停止して自動復帰）/ `OFF`（アプリ終了）
 - **テストポンプ駆動**ボタン：呼び水・動作確認用にポンプだけを数秒回す（ビープ・検知とは独立）
-- **ダッシュボード**：日別の稼働時間・検知/散水件数・一時OFF回数・CPU温度・棒グラフ
+- **ダッシュボード**：直近3回分の撮影（検知・散水の2枚組）、日別の稼働時間・検知/散水件数・一時OFF回数・CPU温度・棒グラフ
 - **ロギング**：全イベントを `events.jsonl` に、日別集計を `stats.json` に永続化。再起動しても UI に復元
 - **Piに優しい設計**：集計はイベント発生時に加算、グラフ描画はブラウザ側、SD保護のため書き込みはまとめ書き
 
@@ -90,6 +90,14 @@ sudo systemctl enable --now cat_deterrent
 
 `Restart=on-failure` のため、Web の `OFF`（正常終了）ではちゃんと止まり、異常クラッシュ時だけ自動復帰します。
 
+サービス登録後は、同梱のスクリプトで起動・再起動できます（稼働確認とURL表示まで行います）。
+
+```bash
+bash start.sh     # 起動（既に稼働中なら何もしない）
+bash restart.sh   # 再起動（コード更新の反映用。構文エラーがあれば中止して現行を残す）
+sudo systemctl stop cat_deterrent   # 停止
+```
+
 ---
 
 ## 🖥️ 画面 / API
@@ -97,7 +105,9 @@ sudo systemctl enable --now cat_deterrent
 | パス | 内容 |
 |---|---|
 | `/` | 操作画面（ON / 一時OFF / OFF / テストポンプ、直近ログ、本日の件数） |
-| `/dashboard` | ダッシュボード（日別集計・CPU温度・グラフ・明細表） |
+| `/dashboard` | ダッシュボード（直近の撮影・日別集計・CPU温度・グラフ・明細表） |
+| `GET /api/photos?limit=3` | 直近の撮影（検知＋散水の組、新しい順・最大20）（JSON） |
+| `GET /photos/<日付>/<ファイル名>` | 撮影画像 |
 | `POST /api/on` `POST /api/pause` `POST /api/off` | 状態制御 |
 | `POST /api/test_pump` | テストポンプ駆動 |
 | `GET /api/status` | 現在状態・直近ログ・本日の件数（JSON） |
@@ -119,6 +129,7 @@ sudo systemctl enable --now cat_deterrent
 | `STATS_FLUSH_INTERVAL` | 集計のディスク書き込み間隔 | 60 秒 |
 | `CAMERA_ENABLED` | カメラ撮影のON/OFF | `True` |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | 撮影解像度（大きい画像は幅に合わせて縮小） | 640 × 480 |
+| `CAMERA_ROTATE` | 保存時の回転（0 / 90 / 180 / 270・時計回り）。カメラを逆さに付けた場合は 180 | 180 |
 | `PHOTO_JPEG_QUALITY` | JPEG画質（下げるほど小さい） | 70 |
 | `SPRAY_SHOT_DELAY` | ポンプONから2枚目を撮るまでの遅れ | 0.5 秒 |
 | `PHOTO_RETENTION_DAYS` | 画像の保存日数（古い日付フォルダは自動削除） | 30 日 |

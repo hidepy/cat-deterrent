@@ -31,7 +31,7 @@ import threading
 from datetime import datetime, timedelta
 from collections import deque
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from gpiozero import MotionSensor, OutputDevice
 
 try:
@@ -85,6 +85,7 @@ CAMERA_ENABLED = True       # Falseでカメラ機能を丸ごと無効化
 CAMERA_DEVICE = 0           # /dev/video0
 CAMERA_WIDTH = 640          # 撮影解像度。これより大きい画像が来たら縮小して保存
 CAMERA_HEIGHT = 480
+CAMERA_ROTATE = 180         # 保存時の回転（0 / 90 / 180 / 270・時計回り）。カメラを逆さに付けたら180
 PHOTO_JPEG_QUALITY = 70     # JPEG画質(0-100)。640x480・70で1枚およそ30〜80KB
 SPRAY_SHOT_DELAY = 0.5      # ポンプON→2枚目を撮るまでの遅れ（ノズルから水が出るまでの時間）
 PHOTO_RETENTION_DAYS = 30   # これより古い日付フォルダは自動削除（SD容量の保護）
@@ -103,6 +104,7 @@ EVENTS_PATH = os.path.join(BASE_DIR, "events.jsonl")  # 生イベントログ（
 PHOTO_DIR = os.path.join(BASE_DIR, "photos")          # 撮影画像（photos/YYYY-MM-DD/*.jpg）
 STATS_FLUSH_INTERVAL = 60   # 稼働時間の集計をディスクへ書く間隔（秒）。SD保護のため大きめ
 DASHBOARD_DAYS = 14         # ダッシュボードに表示する日数
+DASHBOARD_PHOTO_SETS = 3    # ダッシュボードに表示する直近の撮影（検知＋散水の組）数
 # CPU温度のしきい値（ダッシュボードの色分け・℃）
 TEMP_WARN = 60.0
 TEMP_HOT = 70.0
@@ -366,8 +368,12 @@ class Camera:
                 shutdown_event.wait(1)
 
     def _save(self, frame, path):
-        """縮小（必要なら）＋時刻の焼き込み＋JPEG圧縮して保存。"""
+        """回転＋縮小（必要なら）＋時刻の焼き込み＋JPEG圧縮して保存。"""
         try:
+            # 時刻の文字が逆さにならないよう、回転は焼き込みより先に行う
+            rotate = _ROTATE_CODES.get(CAMERA_ROTATE % 360)
+            if rotate is not None:
+                frame = cv2.rotate(frame, rotate)
             h, w = frame.shape[:2]
             if w > CAMERA_WIDTH:
                 frame = cv2.resize(frame, (CAMERA_WIDTH, int(h * CAMERA_WIDTH / w)), interpolation=cv2.INTER_AREA)
@@ -388,6 +394,49 @@ class Camera:
             os.replace(tmp, path)  # 書きかけのファイルを残さない
         except Exception as e:
             print(f"[camera] 保存失敗 {path}: {e}", flush=True)
+
+
+# CAMERA_ROTATE（時計回りの角度）→ OpenCVの回転コード。0度はNone（回転しない）
+_ROTATE_CODES = {} if cv2 is None else {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def recent_photo_sets(limit):
+    """photos/ を新しい順に見て、検知時刻ごとに {1枚目, 2枚目} の組を最大limit件返す。
+    実ファイルを基準にするので、保存に失敗した写真や自動削除済みの写真は出てこない。"""
+    sets = []
+    try:
+        days = sorted((d for d in os.listdir(PHOTO_DIR) if os.path.isdir(os.path.join(PHOTO_DIR, d))), reverse=True)
+    except OSError:
+        return sets
+    for day in days:
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+            names = os.listdir(os.path.join(PHOTO_DIR, day))
+        except (ValueError, OSError):
+            continue
+        groups = {}
+        for name in names:
+            if not name.endswith(".jpg"):
+                continue
+            stamp, _, kind = name[:-4].partition("_")  # "143012_1_detect" → "143012", "1_detect"
+            groups.setdefault(stamp, {})[kind] = f"photos/{day}/{name}"
+        for stamp in sorted(groups, reverse=True):
+            try:
+                taken = datetime.strptime(day + stamp, "%Y-%m-%d%H%M%S")
+            except ValueError:
+                continue
+            sets.append({
+                "time": taken.strftime("%m/%d %H:%M:%S"),
+                "detect": groups[stamp].get("1_detect"),
+                "spray": groups[stamp].get("2_spray"),
+            })
+            if len(sets) >= limit:
+                return sets
+    return sets
 
 
 def _cleanup_old_photos():
@@ -928,6 +977,26 @@ def api_stats():
     })
 
 
+@app.route("/api/photos")
+def api_photos():
+    """直近の撮影（検知＋散水の組）。?limit=N で件数指定（1〜20）。"""
+    try:
+        limit = int(request.args.get("limit", DASHBOARD_PHOTO_SETS))
+    except ValueError:
+        limit = DASHBOARD_PHOTO_SETS
+    return jsonify({
+        "camera_enabled": CAMERA_ENABLED and cv2 is not None,
+        "sets": recent_photo_sets(max(1, min(limit, 20))),
+    })
+
+
+@app.route("/photos/<path:filename>")
+def photo_file(filename):
+    # send_from_directory は photos/ の外（../ 等）へのアクセスを拒否する
+    # 保存後に中身が変わらないファイルなので、ブラウザに長めにキャッシュさせてPiの負荷を減らす
+    return send_from_directory(PHOTO_DIR, filename, max_age=86400)
+
+
 DASHBOARD = """
 <!doctype html>
 <html lang="ja">
@@ -966,6 +1035,15 @@ DASHBOARD = """
     th { color:#94a3b8; font-weight:600; }
     td:first-child, th:first-child { text-align:left; }
     .tbl-wrap { overflow-x:auto; }
+    .shot-set { padding:10px 0; border-bottom:1px solid #334155; }
+    .shot-set:last-child { border-bottom:none; padding-bottom:0; }
+    .shot-time { font-size:.8rem; color:#cbd5e1; margin-bottom:6px; font-family:monospace; }
+    .shot-pair { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .shot { position:relative; display:block; aspect-ratio:4/3; border-radius:8px; overflow:hidden; background:#0f172a; }
+    .shot img { width:100%; height:100%; object-fit:cover; display:block; }
+    .shot .tag { position:absolute; left:6px; bottom:6px; font-size:.65rem; padding:2px 6px; border-radius:4px; background:rgba(15,23,42,.8); color:#e2e8f0; }
+    .shot.none { display:flex; align-items:center; justify-content:center; color:#64748b; font-size:.75rem; }
+    .muted { color:#64748b; font-size:.8rem; }
     .foot { color:#64748b; font-size:.7rem; margin-top:16px; text-align:center; }
   </style>
 </head>
@@ -981,6 +1059,11 @@ DASHBOARD = """
       <div class="tile"><div class="label">本日の一時OFF</div><div class="val" id="t_pause">-<span class="unit"> 回</span></div></div>
       <div class="tile"><div class="label">CPU温度</div><div class="val" id="t_temp">-</div></div>
       <div class="tile"><div class="label">連続稼働</div><div class="val" id="t_uptime" style="font-size:1.2rem;">-</div></div>
+    </div>
+
+    <div class="section">
+      <h2>📷 直近の撮影</h2>
+      <div id="shots"><div class="muted">読み込み中...</div></div>
     </div>
 
     <div class="section">
@@ -1046,6 +1129,33 @@ async function refresh() {
   } catch (e) {
     document.getElementById('t_armed').textContent = '接続不可';
   }
+  refreshShots();
+}
+function shotHtml(src, label) {
+  if (!src) return '<div class="shot none">' + label + '：撮影なし</div>';
+  // タップで原寸を別タブ表示
+  return '<a class="shot" href="/' + src + '" target="_blank" rel="noopener">'
+    + '<img src="/' + src + '" alt="' + label + '" loading="lazy"><span class="tag">' + label + '</span></a>';
+}
+let lastShotsKey = null;
+async function refreshShots() {
+  try {
+    const p = await (await fetch('/api/photos')).json();
+    const key = JSON.stringify(p);
+    if (key === lastShotsKey) return;  // 変化が無ければ描き直さない（画像のちらつき防止）
+    lastShotsKey = key;
+    const el = document.getElementById('shots');
+    if (!p.sets.length) {
+      el.innerHTML = '<div class="muted">' + (p.camera_enabled
+        ? 'まだ撮影された画像はありません'
+        : 'カメラ機能が無効です（CAMERA_ENABLED または OpenCV 未導入）') + '</div>';
+      return;
+    }
+    el.innerHTML = p.sets.map(s =>
+      '<div class="shot-set"><div class="shot-time">' + s.time + '</div><div class="shot-pair">'
+      + shotHtml(s.detect, '① 検知') + shotHtml(s.spray, '② 散水') + '</div></div>'
+    ).join('');
+  } catch (e) { /* 取得失敗時は前回の表示を残す */ }
 }
 refresh();
 setInterval(refresh, 10000);
