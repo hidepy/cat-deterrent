@@ -11,6 +11,8 @@
 
 動作の流れ（ON時）:
   動体検知 → 📷撮影 → 0.5秒の溜め → ビープ1秒 → 1秒待機 → 散水（📷撮影）→ 5秒クールタイム
+  ※昼（カメラ画像が明るい時）は溜めの間に0.3秒間隔で2コマ撮り、画面に動きが無ければ
+    PIRの誤検知（日光など）とみなして散水しない。夜・カメラ不調時はPIRだけで判定。
 
 Webアプリ（Flask）から以下の3状態を制御できます:
   - ON     : 通常稼働
@@ -89,6 +91,21 @@ CAMERA_ROTATE = 180         # 保存時の回転（0 / 90 / 180 / 270・時計�
 PHOTO_JPEG_QUALITY = 70     # JPEG画質(0-100)。640x480・70で1枚およそ30〜80KB
 SPRAY_SHOT_DELAY = 0.5      # ポンプON→2枚目を撮るまでの遅れ（ノズルから水が出るまでの時間）
 PHOTO_RETENTION_DAYS = 30   # これより古い日付フォルダは自動削除（SD容量の保護）
+
+# --- 昼間の誤検知フィルタ（PIR反応 → カメラ2枚の差分で「本当に何か動いたか」を確認）---
+# 日光でPIRが誤反応しても、画面に動きが無ければ散水しない。
+# 夜間（暗くてカメラが役に立たない）やカメラ不調時は、従来どおりPIRだけで散水する。
+MOTION_CHECK_ENABLED = True
+MOTION_CHECK_INTERVAL = 0.3    # 1枚目と2枚目の撮影間隔（秒）。PRE_BEEP_DELAYの溜めの中で行う
+MOTION_PIXEL_THRESHOLD = 25    # 1ピクセルの明るさ差(0-255)がこれ以上なら「変化あり」
+MOTION_MIN_RATIO = 0.005       # 変化ありピクセルが画面のこの割合(0.5%)以上なら「動きあり」
+SAVE_REJECTED_PHOTOS = True    # 誤検知と判定した時の2枚も保存する（しきい値調整用）
+REJECT_COOLDOWN = 3.0          # 誤検知と判定した後、再判定までの待ち（秒）
+
+# 昼夜判定：カメラ画像の平均輝度(0-255)で判定。境目で行ったり来たりしないよう2段階のしきい値
+DAY_BRIGHTNESS = 60            # これ以上になったら「昼」（カメラ確認あり）
+NIGHT_BRIGHTNESS = 40          # これ以下になったら「夜」（PIRのみ）
+BRIGHTNESS_INTERVAL = 30       # 明るさを測る間隔（秒）
 
 # --- Webサーバー ---
 HOST = "0.0.0.0"   # LAN内のどの端末からもアクセス可能に
@@ -182,7 +199,7 @@ PROCESS_START = time.time()  # プロセス起動時刻（稼働時間の算出�
 #    - 集計はイベント発生時にその場で加算するだけ（閲覧時に再計算しない）
 #    - 稼働時間はメモリに貯め、STATS_FLUSH_INTERVAL 秒ごとにまとめ書き
 # ============================================================
-STAT_KEYS = ("armed_sec", "detections", "sprays", "pauses", "resumes", "offs", "startups")
+STAT_KEYS = ("armed_sec", "detections", "sprays", "rejects", "pauses", "resumes", "offs", "startups")
 
 
 class DailyStats:
@@ -216,14 +233,16 @@ class DailyStats:
 
     def incr(self, key, n=1):
         with self.lock:
-            self._bucket()[key] += n
+            b = self._bucket()
+            b[key] = b.get(key, 0) + n  # 古いstats.jsonに無いキー（後から追加した項目）でも落ちない
             self._dirty = True
 
     def add_armed(self, seconds):
         if seconds <= 0:
             return
         with self.lock:
-            self._bucket()["armed_sec"] += seconds
+            b = self._bucket()
+            b["armed_sec"] = b.get("armed_sec", 0) + seconds
             self._dirty = True
 
     def flush(self):
@@ -280,20 +299,72 @@ def read_cpu_temp():
 #  USBカメラ（撮影）
 # ============================================================
 class Camera:
-    """USBカメラを常時オープンし、撮影要求が来たら「その瞬間の」1枚を保存する。
+    """USBカメラを常時オープンし、要求が来たら「その瞬間の」1コマを取り出す。
     - 撮影のたびにopenすると0.5〜1秒かかり露出も合わず暗くなるため、常時オープンにしておく。
     - 裏ではgrab()（デコードなし＝軽い）だけを回してバッファを最新に保ち、
-      撮影要求があった時だけretrieve()でデコードする。
+      要求があった時（と定期的な明るさ測定の時）だけretrieve()でデコードする。
     - capture()は要求を積むだけで即戻る。JPEG圧縮・書き込みも別スレッド。
-      → カメラが無い／抜けた／SDが遅い場合でも、散水シーケンスのタイミングには影響しない。"""
+      → カメラが無い／抜けた／SDが遅い場合でも、散水シーケンスのタイミングには影響しない。
+    - snapshot()は次のコマを待って受け取る（最大SNAPSHOT_TIMEOUT秒）。昼間の動き判定用。"""
 
-    RETRY_SEC = 10        # カメラが見つからない時の再接続間隔
-    MAX_GRAB_FAILS = 20   # 連続でこの回数grabに失敗したら切断とみなす
+    RETRY_SEC = 10          # カメラが見つからない時の再接続間隔
+    MAX_GRAB_FAILS = 20     # 連続でこの回数grabに失敗したら切断とみなす
+    SNAPSHOT_TIMEOUT = 0.5  # snapshot()でコマを待つ上限（秒）
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._pending = []      # 撮影待ちの保存先（絶対パス）
+        self._requests = []     # 次のコマを渡すコールバック（frame → None）
         self._running = False   # 今フレームを取得できている状態か
+        self._light = "unknown"         # 昼夜判定 "day" / "night" / "unknown"
+        self._brightness = None         # 直近の平均輝度(0-255)
+        self._brightness_at = 0.0       # 測定時刻（monotonic）
+
+    # --- 外から使うAPI ---------------------------------------------------
+    def capture(self, taken_for, label):
+        """撮影を要求する（非ブロッキング）。受け付けたら保存先の相対パス、できなければNone。"""
+        path, rel = _photo_path(taken_for, label)
+        taken_at = datetime.now()
+        if not self._request(lambda frame: self.save(frame, path, taken_at)):
+            return None
+        return rel
+
+    def snapshot(self):
+        """次のコマを受け取る（ブロッキング・最大SNAPSHOT_TIMEOUT秒）。取れなければNone。"""
+        done = threading.Event()
+        box = {}
+
+        def receive(frame):
+            box["frame"] = frame
+            done.set()
+
+        if not self._request(receive):
+            return None
+        done.wait(self.SNAPSHOT_TIMEOUT)
+        return box.get("frame")
+
+    def save(self, frame, path, taken_at):
+        """フレームを別スレッドで保存する（非ブロッキング）。"""
+        threading.Thread(target=self._save, args=(frame, path, taken_at), daemon=True).start()
+
+    def light_mode(self):
+        """昼夜判定。カメラが動いていない／明るさが古い場合は "unknown"（＝PIRのみで動作）。"""
+        with self._lock:
+            fresh = time.monotonic() - self._brightness_at <= BRIGHTNESS_INTERVAL * 3
+            if not self._running or self._brightness is None or not fresh:
+                return "unknown"
+            return self._light
+
+    def light_info(self):
+        with self._lock:
+            b = self._brightness
+        return {"mode": self.light_mode(), "brightness": None if b is None else round(b)}
+
+    def _request(self, callback):
+        with self._lock:
+            if not self._running:
+                return False
+            self._requests.append(callback)
+        return True
 
     def start(self):
         if not CAMERA_ENABLED:
@@ -302,17 +373,6 @@ class Camera:
             state.log("📷 OpenCV未導入のため撮影なし（sudo apt install python3-opencv）")
             return
         threading.Thread(target=self._loop, daemon=True).start()
-
-    def capture(self, taken_for, label):
-        """撮影を要求する（非ブロッキング）。受け付けたら保存先の相対パス、できなければNone。"""
-        day = taken_for.strftime("%Y-%m-%d")
-        name = f"{taken_for.strftime('%H%M%S')}_{label}.jpg"
-        path = os.path.join(PHOTO_DIR, day, name)
-        with self._lock:
-            if not self._running:
-                return None
-            self._pending.append(path)
-        return f"photos/{day}/{name}"
 
     def _open(self):
         cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
@@ -338,6 +398,7 @@ class Camera:
                 continue
 
             fails = 0
+            next_measure = 0.0  # 次に明るさを測るmonotonic時刻（接続直後にすぐ測る）
             while not shutdown_event.is_set() and fails < self.MAX_GRAB_FAILS:
                 if not cap.grab():
                     fails += 1
@@ -348,26 +409,50 @@ class Camera:
                 fails = 0
                 with self._lock:
                     self._running = True
-                    pending, self._pending = self._pending, []
+                    requests, self._requests = self._requests, []
                 if announced != "ready":
                     state.log("📷 カメラ準備OK")
                     announced = "ready"
-                if pending:
+                measure = time.monotonic() >= next_measure
+                if requests or measure:
                     ok, frame = cap.retrieve()
                     if ok:
-                        for path in pending:
-                            threading.Thread(target=self._save, args=(frame.copy(), path), daemon=True).start()
+                        if measure:
+                            self._update_light(frame_brightness(frame))
+                            next_measure = time.monotonic() + BRIGHTNESS_INTERVAL
+                        for callback in requests:
+                            callback(frame.copy())
 
             with self._lock:
                 self._running = False
-                self._pending = []
+                self._requests = []
             cap.release()
             if not shutdown_event.is_set():
                 state.log("📷 カメラとの接続が切れました。再接続を試みます")
                 announced = "lost"
                 shutdown_event.wait(1)
 
-    def _save(self, frame, path):
+    def _update_light(self, brightness):
+        """明るさから昼夜を判定（ヒステリシス付き）。切り替わった時だけログに残す。"""
+        with self._lock:
+            prev = self._light
+            if prev == "unknown":
+                new = "day" if brightness >= (DAY_BRIGHTNESS + NIGHT_BRIGHTNESS) / 2 else "night"
+            elif prev == "night" and brightness >= DAY_BRIGHTNESS:
+                new = "day"
+            elif prev == "day" and brightness <= NIGHT_BRIGHTNESS:
+                new = "night"
+            else:
+                new = prev
+            self._light = new
+            self._brightness = brightness
+            self._brightness_at = time.monotonic()
+        if new != prev:
+            label = "☀️ 昼モード（カメラで動きを確認）" if new == "day" else "🌙 夜モード（PIRのみで判定）"
+            state.log(f"{label} 明るさ{brightness:.0f}")
+            log_event("light", mode=new, brightness=round(brightness))
+
+    def _save(self, frame, path, taken_at):
         """回転＋縮小（必要なら）＋時刻の焼き込み＋JPEG圧縮して保存。"""
         try:
             # 時刻の文字が逆さにならないよう、回転は焼き込みより先に行う
@@ -377,7 +462,7 @@ class Camera:
             h, w = frame.shape[:2]
             if w > CAMERA_WIDTH:
                 frame = cv2.resize(frame, (CAMERA_WIDTH, int(h * CAMERA_WIDTH / w)), interpolation=cv2.INTER_AREA)
-            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            stamp = taken_at.strftime("%Y-%m-%d %H:%M:%S.") + f"{taken_at.microsecond // 100000}"
             for color, thick in (((0, 0, 0), 3), ((255, 255, 255), 1)):  # 縁取りで明暗どちらでも読める
                 cv2.putText(frame, stamp, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thick, cv2.LINE_AA)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, PHOTO_JPEG_QUALITY])
@@ -404,6 +489,37 @@ _ROTATE_CODES = {} if cv2 is None else {
 }
 
 
+def _photo_path(taken_for, label):
+    """(保存先の絶対パス, events/APIで使う相対パス)。ファイル名の時刻は検知時刻にそろえる。"""
+    day = taken_for.strftime("%Y-%m-%d")
+    name = f"{taken_for.strftime('%H%M%S')}_{label}.jpg"
+    return os.path.join(PHOTO_DIR, day, name), f"photos/{day}/{name}"
+
+
+def _small_gray(frame):
+    """判定用の縮小グレースケール（160x120）。ノイズを抑えるため軽くぼかす。"""
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (160, 120), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(g, (5, 5), 0)
+
+
+def frame_brightness(frame):
+    """平均輝度(0-255)。"""
+    return cv2.mean(_small_gray(frame))[0]
+
+
+def motion_ratio(frame_a, frame_b):
+    """2コマで明るさが変化したピクセルの割合(0.0〜1.0)。
+    雲や露出の自動調整による「画面全体の明るさの変化」は、平均をそろえてから比べて打ち消す。"""
+    a, b = _small_gray(frame_a), _small_gray(frame_b)
+    mean_a, mean_b = cv2.mean(a)[0], cv2.mean(b)[0]
+    if mean_b > 1:
+        b = cv2.convertScaleAbs(b, alpha=mean_a / mean_b)
+    diff = cv2.absdiff(a, b)
+    _, mask = cv2.threshold(diff, MOTION_PIXEL_THRESHOLD, 255, cv2.THRESH_BINARY)
+    return cv2.countNonZero(mask) / float(mask.size)
+
+
 def recent_photo_sets(limit):
     """photos/ を新しい順に見て、検知時刻ごとに {1枚目, 2枚目} の組を最大limit件返す。
     実ファイルを基準にするので、保存に失敗した写真や自動削除済みの写真は出てこない。"""
@@ -425,6 +541,8 @@ def recent_photo_sets(limit):
             stamp, _, kind = name[:-4].partition("_")  # "143012_1_detect" → "143012", "1_detect"
             groups.setdefault(stamp, {})[kind] = f"photos/{day}/{name}"
         for stamp in sorted(groups, reverse=True):
+            if "1_detect" not in groups[stamp] and "2_spray" not in groups[stamp]:
+                continue  # 誤検知で見送った組（0_reject_*）はダッシュボードに出さない
             try:
                 taken = datetime.strptime(day + stamp, "%Y-%m-%d%H%M%S")
             except ValueError:
@@ -492,6 +610,8 @@ def watchdog_loop():
 EVENT_LABEL = {
     "startup": "起動しました",
     "detect": "★ 動体を検知",
+    "reject": "🙅 誤検知として見送り",
+    "light": "昼夜モード切替",
     "spray": "💧 散水",
     "test_pump": "💧 テストポンプ駆動",
     "pause": "🟡 一時OFF",
@@ -562,24 +682,76 @@ def restore_from_log():
 # ============================================================
 #  散水シーケンス（ビープ→待機→散水）
 # ============================================================
+def _daytime_motion_check(detected_at):
+    """昼間の誤検知フィルタ。0.3秒間隔の2コマを比べて、画面に動きがあるか確かめる。
+    戻り値: (判定, 1コマ目, 変化率)
+      判定 True=動きあり / False=動きなし（PIRの誤検知）/ None=カメラから取れず確認不能"""
+    frame_a = camera.snapshot()
+    if frame_a is None:
+        return None, None, None
+    time.sleep(MOTION_CHECK_INTERVAL)
+    frame_b = camera.snapshot()
+    if frame_b is None:
+        return None, frame_a, None
+    ratio = motion_ratio(frame_a, frame_b)
+    if ratio < MOTION_MIN_RATIO and SAVE_REJECTED_PHOTOS:
+        taken_a = detected_at
+        taken_b = detected_at + timedelta(seconds=MOTION_CHECK_INTERVAL)
+        camera.save(frame_a, _photo_path(detected_at, "0_reject_a")[0], taken_a)
+        camera.save(frame_b, _photo_path(detected_at, "0_reject_b")[0], taken_b)
+    return ratio >= MOTION_MIN_RATIO, frame_a, ratio
+
+
 def run_spray_sequence():
-    """検知時の一連の動作。修正依頼3の順序を厳守。"""
+    """検知時の一連の動作。
+    戻り値: "sprayed"=散水まで実行 / "rejected"=昼間の誤検知として見送り / None=実行せず"""
     with state.lock:
         # シーケンス直前に念のため状態を再確認
         # （OFF/一時OFF、故障モード、あるいはテストポンプ駆動中(busy)なら中止）
         if state.mode != "ON" or shutdown_event.is_set() or state.busy or state.fault:
-            return
+            return None
         state.busy = True
-        detected_at = datetime.now()
-        state.last_motion = detected_at
+    detected_at = datetime.now()
+    started = time.monotonic()
 
     try:
-        # 1枚目：検知した瞬間（撮影は非ブロッキング。カメラが無ければNone）
-        detect_photo = camera.capture(detected_at, "1_detect")
-        state.log("★ 動体を検知 → 撮影・警告ビープ" if detect_photo else "★ 動体を検知 → 警告ビープ")
+        # --- 昼：カメラで動きを確認してから進む / 夜・カメラ不調：PIRだけで進む ---
+        light = camera.light_mode() if MOTION_CHECK_ENABLED else "off"
+        check = {"light": light}
+        if light == "day":
+            moved, frame_a, ratio = _daytime_motion_check(detected_at)
+            if ratio is not None:
+                check["ratio"] = round(ratio, 4)
+            if moved is False:
+                state.log(f"🙅 PIRは反応したが画面に動きなし（変化{ratio * 100:.2f}%）→ 誤検知として見送り")
+                stats.incr("rejects")
+                log_event("reject", **check)
+                return "rejected"
+            if moved is None:
+                check["check"] = "unavailable"  # カメラから取れなかった → 安全側ではなく従来動作（PIRのみ）
+            detect_photo = None
+            if frame_a is not None:
+                path, detect_photo = _photo_path(detected_at, "1_detect")
+                camera.save(frame_a, path, detected_at)
+        else:
+            # 1枚目：検知した瞬間（撮影は非ブロッキング。カメラが無ければNone）
+            detect_photo = camera.capture(detected_at, "1_detect")
+
+        with state.lock:
+            state.last_motion = detected_at
+        mode_note = {"day": "（☀️動きを確認済み）", "night": "（🌙PIRのみ）"}.get(light, "")
+        if check.get("check") == "unavailable":
+            mode_note = "（☀️カメラ確認できずPIRのみ）"
+        state.log(f"★ 動体を検知{mode_note} → 警告ビープ")
         stats.incr("detections")
-        log_event("detect", **({"photo": detect_photo} if detect_photo else {}))
-        time.sleep(PRE_BEEP_DELAY)  # 溜め
+        if detect_photo:
+            check["photo"] = detect_photo
+        log_event("detect", **check)
+
+        # 溜め：昼の確認にかかった時間もここに含める（ビープまでの間隔を昼夜で変えない）
+        remain = PRE_BEEP_DELAY - (time.monotonic() - started)
+        if remain > 0:
+            time.sleep(remain)
 
         buzzer.on()
         time.sleep(BEEP_DURATION)
@@ -612,6 +784,7 @@ def run_spray_sequence():
             count = len(state.spray_times)
         if count >= RUNAWAY_MAX:
             enter_fault(f"直近{RUNAWAY_WINDOW}秒で自動散水{count}回（暴走を検知）")
+        return "sprayed"
     finally:
         # どんな経路でも必ず停止させる（安全側）
         buzzer.off()
@@ -686,8 +859,10 @@ def monitoring_loop():
         # --- ON・故障でない・クールタイム外なら検知を評価 ---
         if mode == "ON" and not fault and now_mono >= cooldown_until:
             if pir.motion_detected:
-                run_spray_sequence()
-                cooldown_until = time.monotonic() + COOLDOWN
+                result = run_spray_sequence()
+                # 誤検知で見送った時は短めの待ちで再判定（日光でPIRが出っぱなしでも空回りさせない）
+                wait = REJECT_COOLDOWN if result == "rejected" else COOLDOWN
+                cooldown_until = time.monotonic() + wait
                 last_tick = time.monotonic()  # 散水中の時間は稼働時間に含めない
 
         # --- 定期フラッシュ（SD保護のためまとめ書き）---
@@ -974,6 +1149,9 @@ def api_stats():
         "temp_hot": TEMP_HOT,
         "uptime_str": _fmt_duration(time.time() - PROCESS_START),
         "mode": state.mode,
+        "light": camera.light_info() if MOTION_CHECK_ENABLED else {"mode": "off", "brightness": None},
+        "day_brightness": DAY_BRIGHTNESS,
+        "night_brightness": NIGHT_BRIGHTNESS,
     })
 
 
@@ -1056,6 +1234,8 @@ DASHBOARD = """
       <div class="tile"><div class="label">本日の稼働時間</div><div class="val" id="t_armed">-</div></div>
       <div class="tile"><div class="label">本日の検知</div><div class="val" id="t_detect">-<span class="unit"> 件</span></div></div>
       <div class="tile"><div class="label">本日の散水</div><div class="val" id="t_spray">-<span class="unit"> 件</span></div></div>
+      <div class="tile"><div class="label">本日の誤検知見送り</div><div class="val" id="t_reject">-<span class="unit"> 件</span></div></div>
+      <div class="tile"><div class="label">判定モード</div><div class="val" id="t_light" style="font-size:1.1rem;">-</div><div class="label" id="t_bright"></div></div>
       <div class="tile"><div class="label">本日の一時OFF</div><div class="val" id="t_pause">-<span class="unit"> 回</span></div></div>
       <div class="tile"><div class="label">CPU温度</div><div class="val" id="t_temp">-</div></div>
       <div class="tile"><div class="label">連続稼働</div><div class="val" id="t_uptime" style="font-size:1.2rem;">-</div></div>
@@ -1076,7 +1256,7 @@ DASHBOARD = """
       <h2>日別 明細</h2>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>日付</th><th>稼働時間</th><th>検知</th><th>散水</th><th>一時OFF</th><th>復帰</th><th>OFF</th><th>起動</th></tr></thead>
+          <thead><tr><th>日付</th><th>稼働時間</th><th>検知</th><th>散水</th><th>見送り</th><th>一時OFF</th><th>復帰</th><th>OFF</th><th>起動</th></tr></thead>
           <tbody id="tbody"></tbody>
         </table>
       </div>
@@ -1100,6 +1280,12 @@ async function refresh() {
     document.getElementById('t_detect').innerHTML   = (today.detections||0) + '<span class="unit"> 件</span>';
     document.getElementById('t_spray').innerHTML    = (today.sprays||0) + '<span class="unit"> 件</span>';
     document.getElementById('t_pause').innerHTML    = (today.pauses||0) + '<span class="unit"> 回</span>';
+    document.getElementById('t_reject').innerHTML   = (today.rejects||0) + '<span class="unit"> 件</span>';
+    const light = s.light || {};
+    const LIGHT_LABEL = { day: '☀️ 昼（カメラ確認）', night: '🌙 夜（PIRのみ）', unknown: '📷 カメラ無し（PIRのみ）', off: '確認OFF（PIRのみ）' };
+    document.getElementById('t_light').textContent = LIGHT_LABEL[light.mode] || '-';
+    document.getElementById('t_bright').textContent = light.brightness == null ? ''
+      : '明るさ ' + light.brightness + '（昼≧' + s.day_brightness + ' / 夜≦' + s.night_brightness + '）';
     document.getElementById('t_uptime').textContent = s.uptime_str;
     const tEl = document.getElementById('t_temp');
     tEl.textContent = (s.cpu_temp == null ? 'N/A' : s.cpu_temp + '℃');
@@ -1124,7 +1310,7 @@ async function refresh() {
     // 明細テーブル（新しい日付を上に）
     document.getElementById('tbody').innerHTML = days.slice().reverse().map(d =>
       '<tr><td>'+d.date+'</td><td>'+d.armed_str+'</td><td>'+d.detections+'</td><td>'+d.sprays
-      +'</td><td>'+d.pauses+'</td><td>'+d.resumes+'</td><td>'+d.offs+'</td><td>'+d.startups+'</td></tr>'
+      +'</td><td>'+d.rejects+'</td><td>'+d.pauses+'</td><td>'+d.resumes+'</td><td>'+d.offs+'</td><td>'+d.startups+'</td></tr>'
     ).join('');
   } catch (e) {
     document.getElementById('t_armed').textContent = '接続不可';

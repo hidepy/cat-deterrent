@@ -9,6 +9,7 @@ Raspberry Pi を使った**猫撃退システム**。PIRセンサーで動体を
 ## ✨ 主な機能
 
 - **自動散水**：動体検知 → 📷撮影 → 0.5秒の溜め → ビープ(1秒) → 1秒待機 → 散水（📷撮影） → クールタイム(5秒)
+- **昼間の誤検知フィルタ**：昼（カメラ画像が明るい時）は PIR 反応後に 0.3 秒間隔で2コマ撮り、画面に動きが無ければ日光などによる誤検知とみなして散水しない。夜・カメラ不調時は PIR のみで判定
 - **撮影**（USBカメラ・任意）：検知の瞬間と散水の瞬間の2枚をJPEG圧縮して `photos/` に保存。カメラが無くても散水は通常どおり動作
 - **Web UI**（スマホ対応）：`ON` / `一時OFF`（5分停止して自動復帰）/ `OFF`（アプリ終了）
 - **テストポンプ駆動**ボタン：呼び水・動作確認用にポンプだけを数秒回す（ビープ・検知とは独立）
@@ -133,6 +134,19 @@ sudo systemctl stop cat_deterrent   # 停止
 | `PHOTO_JPEG_QUALITY` | JPEG画質（下げるほど小さい） | 70 |
 | `SPRAY_SHOT_DELAY` | ポンプONから2枚目を撮るまでの遅れ | 0.5 秒 |
 | `PHOTO_RETENTION_DAYS` | 画像の保存日数（古い日付フォルダは自動削除） | 30 日 |
+| `MOTION_CHECK_ENABLED` | 昼間の誤検知フィルタのON/OFF | `True` |
+| `MOTION_CHECK_INTERVAL` | 動き判定の2コマの撮影間隔 | 0.3 秒 |
+| `MOTION_PIXEL_THRESHOLD` | 1ピクセルを「変化あり」とみなす明るさ差（0-255） | 25 |
+| `MOTION_MIN_RATIO` | 「動きあり」とみなす変化ピクセルの割合 | 0.005（0.5%） |
+| `SAVE_REJECTED_PHOTOS` | 誤検知と判定した2コマも保存する（`*_0_reject_a/b.jpg`） | `True` |
+| `REJECT_COOLDOWN` | 誤検知と判定した後、再判定までの待ち | 3.0 秒 |
+| `DAY_BRIGHTNESS` / `NIGHT_BRIGHTNESS` | 平均輝度がこれ以上で昼／以下で夜（間は直前の判定を維持） | 60 / 40 |
+| `BRIGHTNESS_INTERVAL` | 明るさを測る間隔 | 30 秒 |
+
+### 誤検知フィルタのしきい値調整
+- `events.jsonl` の `detect` / `reject` に、昼の判定時は `"ratio"`（変化ピクセルの割合）が記録されます。猫が写っていたのに `reject` になった例があれば `MOTION_MIN_RATIO` を下げ、誤検知なのに `detect` になった例が多ければ上げてください。
+- 見送った時の2コマは `photos/日付/HHMMSS_0_reject_a.jpg` / `_b.jpg` に保存されます（ダッシュボードには出ません）。
+- ダッシュボードの「判定モード」に現在の明るさが出ます。夕方・明け方の値を見て `DAY_BRIGHTNESS` / `NIGHT_BRIGHTNESS` を合わせてください。
 
 ---
 
