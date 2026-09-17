@@ -12,7 +12,9 @@
 動作の流れ（ON時）:
   動体検知 → 📷撮影 → 0.5秒の溜め → ビープ1秒 → 1秒待機 → 散水（📷撮影）→ 5秒クールタイム
   ※昼（カメラ画像が明るい時）は溜めの間に0.3秒間隔で2コマ撮り、画面に動きが無ければ
-    PIRの誤検知（日光など）とみなして散水しない。夜・カメラ不調時はPIRだけで判定。
+    PIRの誤検知（日光など）とみなして散水しない（お試しモードでは判定を記録するだけ）。
+    夜・カメラ不調時はPIRだけで判定。結果は /review で確認できる。
+  ※10分に5回以上散水が続いたら、次の検知までの間隔を段階的に延ばす（ポンプ負荷・水切れ対策）。
 
 Webアプリ（Flask）から以下の3状態を制御できます:
   - ON     : 通常稼働
@@ -24,6 +26,7 @@ Webアプリ（Flask）から以下の3状態を制御できます:
 """
 
 import os
+import re
 import json
 import time
 import shutil
@@ -86,7 +89,7 @@ BUZZER_ACTIVE_HIGH = False
 CAMERA_ENABLED = True       # Falseでカメラ機能を丸ごと無効化
 CAMERA_DEVICE = 0           # /dev/video0
 CAMERA_WIDTH = 640          # 撮影解像度。これより大きい画像が来たら縮小して保存
-CAMERA_HEIGHT = 480
+CAMERA_HEIGHT = 360         # 16:9。4:3(480)を指定すると16:9センサーの左右が切られ画角が狭くなるカメラが多い
 CAMERA_ROTATE = 180         # 保存時の回転（0 / 90 / 180 / 270・時計回り）。カメラを逆さに付けたら180
 PHOTO_JPEG_QUALITY = 70     # JPEG画質(0-100)。640x480・70で1枚およそ30〜80KB
 SPRAY_SHOT_DELAY = 0.5      # ポンプON→2枚目を撮るまでの遅れ（ノズルから水が出るまでの時間）
@@ -95,12 +98,28 @@ PHOTO_RETENTION_DAYS = 30   # これより古い日付フォルダは自動削�
 # --- 昼間の誤検知フィルタ（PIR反応 → カメラ2枚の差分で「本当に何か動いたか」を確認）---
 # 日光でPIRが誤反応しても、画面に動きが無ければ散水しない。
 # 夜間（暗くてカメラが役に立たない）やカメラ不調時は、従来どおりPIRだけで散水する。
-MOTION_CHECK_ENABLED = True
+#   "trial"   : お試し。判定して記録・撮影するだけで、散水は止めない（/review で結果を確認）
+#   "enforce" : 本番。動きが無ければ散水を見送る
+#   "off"     : 判定しない（PIRのみ）
+# ※ダッシュボードから切り替えられる。画面で一度切り替えると runtime_settings.json の値が優先され、
+#   ここは「まだ画面で選んでいない時の初期値」になる。
+MOTION_CHECK_MODE = "trial"
+MOTION_CHECK_MODES = ("trial", "enforce", "off")
 MOTION_CHECK_INTERVAL = 0.3    # 1枚目と2枚目の撮影間隔（秒）。PRE_BEEP_DELAYの溜めの中で行う
 MOTION_PIXEL_THRESHOLD = 25    # 1ピクセルの明るさ差(0-255)がこれ以上なら「変化あり」
 MOTION_MIN_RATIO = 0.005       # 変化ありピクセルが画面のこの割合(0.5%)以上なら「動きあり」
-SAVE_REJECTED_PHOTOS = True    # 誤検知と判定した時の2枚も保存する（しきい値調整用）
-REJECT_COOLDOWN = 3.0          # 誤検知と判定した後、再判定までの待ち（秒）
+REJECT_COOLDOWN = 3.0          # 本番モードで見送った後、再判定までの待ち（秒）
+
+# --- 散水しすぎ防止（誤検知が続く時にポンプ負荷・水切れを防ぐ）---
+# 直近SPRAY_RATE_WINDOW秒の自動散水がSPRAY_RATE_MAX回以上になったら、次の検知を受け付けるまでの
+# 間隔を THROTTLE_BASE → 2倍…（最大THROTTLE_MAX）と段階的に延ばす。最大10分なら散水は1時間に約6回まで。
+# 前回の散水からTHROTTLE_CALM秒以上あいたら（＝PIRが落ち着いた）通常に戻す。
+#   ※9/16〜17の実ログで試算: 9/17(晴れ) 312回→約72回（延長中は5〜6回/時）、9/16 29回→27回
+SPRAY_RATE_WINDOW = 10 * 60
+SPRAY_RATE_MAX = 5
+THROTTLE_BASE = 5 * 60
+THROTTLE_MAX = 10 * 60
+THROTTLE_CALM = 30 * 60
 
 # 昼夜判定：カメラ画像の平均輝度(0-255)で判定。境目で行ったり来たりしないよう2段階のしきい値
 DAY_BRIGHTNESS = 60            # これ以上になったら「昼」（カメラ確認あり）
@@ -119,6 +138,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")    # 1日ごとの集計（小さいJSON）
 EVENTS_PATH = os.path.join(BASE_DIR, "events.jsonl")  # 生イベントログ（1行1JSON）
 PHOTO_DIR = os.path.join(BASE_DIR, "photos")          # 撮影画像（photos/YYYY-MM-DD/*.jpg）
+LABELS_PATH = os.path.join(BASE_DIR, "review_labels.json")  # 判定レビュー画面で付けた正解ラベル
+SETTINGS_PATH = os.path.join(BASE_DIR, "runtime_settings.json")  # 画面から変更した設定（再起動しても保持）
 STATS_FLUSH_INTERVAL = 60   # 稼働時間の集計をディスクへ書く間隔（秒）。SD保護のため大きめ
 DASHBOARD_DAYS = 14         # ダッシュボードに表示する日数
 DASHBOARD_PHOTO_SETS = 3    # ダッシュボードに表示する直近の撮影（検知＋散水の組）数
@@ -180,6 +201,10 @@ class SystemState:
         self.fault = False          # 故障モード（自動散水を停止・ラッチ）
         self.fault_reason = ""      # 故障モードに入った理由
         self.spray_times = deque()  # 自動散水のmonotonic時刻（暴走検知用・手動は含めない）
+        self.rate_times = deque()   # 自動散水のmonotonic時刻（散水しすぎ防止用・直近SPRAY_RATE_WINDOW秒）
+        self.next_ready = 0.0       # この時刻(monotonic)まで次の検知を受け付けない（クールタイム）
+        self.throttle_level = 0     # 散水間隔の延長段階（0=通常）
+        self.throttle_until = None  # 延長中の再開予定時刻（datetime・表示用）
 
     def log(self, message):
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -199,7 +224,8 @@ PROCESS_START = time.time()  # プロセス起動時刻（稼働時間の算出�
 #    - 集計はイベント発生時にその場で加算するだけ（閲覧時に再計算しない）
 #    - 稼働時間はメモリに貯め、STATS_FLUSH_INTERVAL 秒ごとにまとめ書き
 # ============================================================
-STAT_KEYS = ("armed_sec", "detections", "sprays", "rejects", "pauses", "resumes", "offs", "startups")
+STAT_KEYS = ("armed_sec", "detections", "sprays", "rejects", "trial_rejects", "throttles",
+             "pauses", "resumes", "offs", "startups")
 
 
 class DailyStats:
@@ -273,6 +299,41 @@ class DailyStats:
 
 
 stats = DailyStats(STATS_PATH)
+
+
+class RuntimeSettings:
+    """画面から変更できる設定を小さなJSONに保存する（変更時のみ書き込み・アトミック）。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.data = data if isinstance(data, dict) else {}
+        except (FileNotFoundError, ValueError):
+            self.data = {}
+
+    def get(self, key, default=None):
+        with self.lock:
+            return self.data.get(key, default)
+
+    def set(self, key, value):
+        with self.lock:
+            self.data[key] = value
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+
+
+settings = RuntimeSettings(SETTINGS_PATH)
+
+
+def motion_check_mode():
+    """現在の昼間カメラ判定モード（画面で選んだ値 → 無ければコードの初期値）。"""
+    mode = settings.get("motion_check_mode", MOTION_CHECK_MODE)
+    return mode if mode in MOTION_CHECK_MODES else "off"
 
 
 def log_event(event_type, **extra):
@@ -497,9 +558,10 @@ def _photo_path(taken_for, label):
 
 
 def _small_gray(frame):
-    """判定用の縮小グレースケール（160x120）。ノイズを抑えるため軽くぼかす。"""
+    """判定用の縮小グレースケール（幅160・縦横比は維持）。ノイズを抑えるため軽くぼかす。"""
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, (160, 120), interpolation=cv2.INTER_AREA)
+    h, w = g.shape[:2]
+    g = cv2.resize(g, (160, max(1, round(160 * h / w))), interpolation=cv2.INTER_AREA)
     return cv2.GaussianBlur(g, (5, 5), 0)
 
 
@@ -618,6 +680,9 @@ EVENT_LABEL = {
     "resume": "⏰ 稼働に復帰",
     "on": "🟢 ON",
     "off": "🔴 OFF：終了",
+    "throttle": "⏳ 散水間隔を延長",
+    "throttle_reset": "✅ 散水間隔を通常に戻した",
+    "check_mode": "🔀 昼間のカメラ判定モードを変更",
 }
 
 
@@ -682,24 +747,19 @@ def restore_from_log():
 # ============================================================
 #  散水シーケンス（ビープ→待機→散水）
 # ============================================================
-def _daytime_motion_check(detected_at):
+def _daytime_motion_check():
     """昼間の誤検知フィルタ。0.3秒間隔の2コマを比べて、画面に動きがあるか確かめる。
-    戻り値: (判定, 1コマ目, 変化率)
-      判定 True=動きあり / False=動きなし（PIRの誤検知）/ None=カメラから取れず確認不能"""
+    戻り値: (判定, 1コマ目, 2コマ目, 変化率)
+      判定 "pass"=動きあり / "reject"=動きなし（PIRの誤検知）/ "unavailable"=カメラから取れず確認不能"""
     frame_a = camera.snapshot()
     if frame_a is None:
-        return None, None, None
+        return "unavailable", None, None, None
     time.sleep(MOTION_CHECK_INTERVAL)
     frame_b = camera.snapshot()
     if frame_b is None:
-        return None, frame_a, None
+        return "unavailable", frame_a, None, None
     ratio = motion_ratio(frame_a, frame_b)
-    if ratio < MOTION_MIN_RATIO and SAVE_REJECTED_PHOTOS:
-        taken_a = detected_at
-        taken_b = detected_at + timedelta(seconds=MOTION_CHECK_INTERVAL)
-        camera.save(frame_a, _photo_path(detected_at, "0_reject_a")[0], taken_a)
-        camera.save(frame_b, _photo_path(detected_at, "0_reject_b")[0], taken_b)
-    return ratio >= MOTION_MIN_RATIO, frame_a, ratio
+    return ("pass" if ratio >= MOTION_MIN_RATIO else "reject"), frame_a, frame_b, ratio
 
 
 def run_spray_sequence():
@@ -715,37 +775,51 @@ def run_spray_sequence():
     started = time.monotonic()
 
     try:
-        # --- 昼：カメラで動きを確認してから進む / 夜・カメラ不調：PIRだけで進む ---
-        light = camera.light_mode() if MOTION_CHECK_ENABLED else "off"
+        # --- 昼：カメラで動きを確認 / 夜・カメラ不調：PIRだけで進む ---
+        check_mode = motion_check_mode()
+        light = camera.light_mode() if check_mode != "off" else "off"
         check = {"light": light}
+        mode_note = {"night": "（🌙PIRのみ）", "unknown": "（📷カメラ無しPIRのみ）"}.get(light, "")
         if light == "day":
-            moved, frame_a, ratio = _daytime_motion_check(detected_at)
+            verdict, frame_a, frame_b, ratio = _daytime_motion_check()
+            check.update(check_mode=check_mode, verdict=verdict)
             if ratio is not None:
                 check["ratio"] = round(ratio, 4)
-            if moved is False:
-                state.log(f"🙅 PIRは反応したが画面に動きなし（変化{ratio * 100:.2f}%）→ 誤検知として見送り")
+            enforced_reject = verdict == "reject" and check_mode == "enforce"
+            # 判定に使った2コマは結果にかかわらず保存（/review で判定の当否を確認する材料）
+            # 本番で見送った組は、ダッシュボードの写真欄に出ないよう別名にする
+            for frame, label, offset, key in ((frame_a, "1_detect", 0.0, "photo"),
+                                              (frame_b, "1b_check", MOTION_CHECK_INTERVAL, "photo_b")):
+                if frame is None:
+                    continue
+                if enforced_reject:
+                    label = "0_reject_a" if key == "photo" else "0_reject_b"
+                path, check[key] = _photo_path(detected_at, label)
+                camera.save(frame, path, detected_at + timedelta(seconds=offset))
+            ratio_str = "" if ratio is None else f" 変化{ratio * 100:.2f}%"
+
+            if enforced_reject:
+                state.log(f"🙅 PIRは反応したが画面に動きなし（{ratio_str.strip()}）→ 誤検知として見送り")
                 stats.incr("rejects")
                 log_event("reject", **check)
                 return "rejected"
-            if moved is None:
-                check["check"] = "unavailable"  # カメラから取れなかった → 安全側ではなく従来動作（PIRのみ）
-            detect_photo = None
-            if frame_a is not None:
-                path, detect_photo = _photo_path(detected_at, "1_detect")
-                camera.save(frame_a, path, detected_at)
+            if verdict == "unavailable":
+                mode_note = "（☀️カメラ確認できずPIRのみ）"
+            elif verdict == "reject":  # お試しモード：本番なら見送っていた
+                stats.incr("trial_rejects")
+                mode_note = f"（🧪お試し判定: 動きなし＝本番なら見送り{ratio_str}）"
+            else:
+                mode_note = f"（☀️動きあり{ratio_str}）"
         else:
             # 1枚目：検知した瞬間（撮影は非ブロッキング。カメラが無ければNone）
             detect_photo = camera.capture(detected_at, "1_detect")
+            if detect_photo:
+                check["photo"] = detect_photo
 
         with state.lock:
             state.last_motion = detected_at
-        mode_note = {"day": "（☀️動きを確認済み）", "night": "（🌙PIRのみ）"}.get(light, "")
-        if check.get("check") == "unavailable":
-            mode_note = "（☀️カメラ確認できずPIRのみ）"
         state.log(f"★ 動体を検知{mode_note} → 警告ビープ")
         stats.incr("detections")
-        if detect_photo:
-            check["photo"] = detect_photo
         log_event("detect", **check)
 
         # 溜め：昼の確認にかかった時間もここに含める（ビープまでの間隔を昼夜で変えない）
@@ -816,12 +890,46 @@ def run_test_pump():
 # ============================================================
 #  監視ループ（バックグラウンドスレッド）
 # ============================================================
+def _wait_after_spray():
+    """散水後、次の検知を受け付けるまでの待ち（秒）。散水が続きすぎる時は段階的に延ばす。"""
+    now_m = time.monotonic()
+    event = None
+    with state.lock:
+        # 前回の散水からTHROTTLE_CALM秒以上あいた＝延長明け後もしばらくPIRが反応しなかった → 通常に戻す
+        # （「10分窓の回数」で戻すと、延長そのもので回数が減るだけなのに戻ってしまい、また連発するため）
+        if state.throttle_level and state.rate_times and now_m - state.rate_times[-1] >= THROTTLE_CALM:
+            state.throttle_level = 0
+            event = "reset"
+        state.rate_times.append(now_m)
+        while state.rate_times and now_m - state.rate_times[0] >= SPRAY_RATE_WINDOW:
+            state.rate_times.popleft()
+        count = len(state.rate_times)
+        if count >= SPRAY_RATE_MAX:
+            state.throttle_level += 1
+            event = "up"
+        level = state.throttle_level
+        if level:
+            wait = min(THROTTLE_BASE * 2 ** min(level - 1, 16), THROTTLE_MAX)
+            state.throttle_until = datetime.now() + timedelta(seconds=wait)
+        else:
+            wait = COOLDOWN
+            state.throttle_until = None
+
+    if event == "reset":
+        state.log("✅ 散水ペースが落ち着いたため、散水間隔を通常に戻しました")
+        log_event("throttle_reset")
+    elif event == "up":
+        state.log(f"⏳ 直近{SPRAY_RATE_WINDOW // 60}分で散水{count}回 → 誤検知の可能性。"
+                  f"次の検知まで{wait / 60:.0f}分あけます（延長段階{level}）")
+        stats.incr("throttles")
+        log_event("throttle", level=level, count=count, wait_sec=wait)
+    return wait
+
+
 def monitoring_loop():
     state.log(f"センサー初期化中（約{SENSOR_WARMUP}秒）...")
     time.sleep(SENSOR_WARMUP)
     state.log("監視スタンバイ完了！稼働中です")
-
-    cooldown_until = 0.0  # time.time()基準。この時刻まで再検知しない
 
     # 稼働時間の集計（メモリに貯めてまとめ書き）
     armed_local = 0.0
@@ -857,12 +965,20 @@ def monitoring_loop():
             armed_local += elapsed
 
         # --- ON・故障でない・クールタイム外なら検知を評価 ---
-        if mode == "ON" and not fault and now_mono >= cooldown_until:
+        with state.lock:
+            ready = now_mono >= state.next_ready  # クールタイム（散水しすぎ時は延長）明けか
+        if mode == "ON" and not fault and ready:
             if pir.motion_detected:
                 result = run_spray_sequence()
-                # 誤検知で見送った時は短めの待ちで再判定（日光でPIRが出っぱなしでも空回りさせない）
-                wait = REJECT_COOLDOWN if result == "rejected" else COOLDOWN
-                cooldown_until = time.monotonic() + wait
+                if result == "sprayed":
+                    wait = _wait_after_spray()
+                elif result == "rejected":
+                    # 誤検知で見送った時は短めの待ちで再判定（日光でPIRが出っぱなしでも空回りさせない）
+                    wait = REJECT_COOLDOWN
+                else:
+                    wait = COOLDOWN
+                with state.lock:
+                    state.next_ready = time.monotonic() + wait
                 last_tick = time.monotonic()  # 散水中の時間は稼働時間に含めない
 
         # --- 定期フラッシュ（SD保護のためまとめ書き）---
@@ -958,7 +1074,7 @@ PAGE = """
 
     <div class="logs" id="logs"></div>
   </div>
-  <div class="foot">画面は2秒ごとに自動更新されます ・ <a href="/dashboard" style="color:#60a5fa;">📊 ダッシュボード</a></div>
+  <div class="foot">画面は2秒ごとに自動更新されます ・ <a href="/dashboard" style="color:#60a5fa;">📊 ダッシュボード</a> ・ <a href="/review" style="color:#60a5fa;">🧪 判定レビュー</a></div>
 
 <script>
 async function refresh() {
@@ -971,7 +1087,10 @@ async function refresh() {
       el.innerHTML = '🚨 故障モード<small>' + (s.fault_reason || '異常を検知') + '<br>安全のため自動散水を停止中。ONを押すと解除します</small>';
     } else if (s.mode === 'ON') {
       el.className = 'status on';
-      el.innerHTML = '稼働中 🟢' + (s.busy ? '<small>動作中...</small>' : '<small>監視しています</small>');
+      el.innerHTML = '稼働中 🟢' + (s.busy ? '<small>動作中...</small>'
+        : s.throttle_remaining ? '<small>⏳ 散水が続いたため間隔を延長中（あと約 ' + s.throttle_remaining
+            + '・段階' + s.throttle_level + '）<br>すぐ再開するにはONを押してください</small>'
+        : '<small>監視しています</small>');
     } else {
       el.className = 'status paused';
       el.innerHTML = '一時停止中 🟡<small>あと約 ' + s.pause_remaining + ' で自動復帰</small>';
@@ -1044,7 +1163,13 @@ def api_status():
         if state.mode == "PAUSED" and state.pause_until:
             secs = max(0, int((state.pause_until - datetime.now()).total_seconds()))
             remaining = f"{secs // 60}分{secs % 60}秒"
+        throttle_remaining = ""
+        if state.throttle_until and state.throttle_until > datetime.now():
+            secs = int((state.throttle_until - datetime.now()).total_seconds())
+            throttle_remaining = f"{secs // 60}分{secs % 60}秒"
         data = {
+            "throttle_level": state.throttle_level,
+            "throttle_remaining": throttle_remaining,
             "mode": state.mode,
             "busy": state.busy,
             "fault": state.fault,
@@ -1071,7 +1196,13 @@ def api_on():
         state.fault = False           # 故障モードを解除
         state.fault_reason = ""
         state.spray_times.clear()     # 暴走カウンタもリセット
-    state.log("🟢 ONにしました（Web操作）" + ("／故障モードを解除" if was_fault else ""))
+        was_throttled = state.throttle_level > 0
+        state.rate_times.clear()      # 散水間隔の延長も解除（手動で再開した意思を優先）
+        state.throttle_level = 0
+        state.throttle_until = None
+        state.next_ready = 0.0
+    state.log("🟢 ONにしました（Web操作）" + ("／故障モードを解除" if was_fault else "")
+              + ("／散水間隔の延長を解除" if was_throttled else ""))
     if was_paused:
         stats.incr("resumes")
     log_event("on", source="web", cleared_fault=was_fault)
@@ -1149,10 +1280,31 @@ def api_stats():
         "temp_hot": TEMP_HOT,
         "uptime_str": _fmt_duration(time.time() - PROCESS_START),
         "mode": state.mode,
-        "light": camera.light_info() if MOTION_CHECK_ENABLED else {"mode": "off", "brightness": None},
+        "light": camera.light_info() if motion_check_mode() != "off" else {"mode": "off", "brightness": None},
+        "check_mode": motion_check_mode(),
         "day_brightness": DAY_BRIGHTNESS,
         "night_brightness": NIGHT_BRIGHTNESS,
     })
+
+
+CHECK_MODE_LABEL = {"trial": "🧪 お試し", "enforce": "✅ 本番", "off": "OFF（PIRのみ）"}
+
+
+@app.route("/api/check_mode", methods=["POST"])
+def api_check_mode():
+    """昼間カメラ判定モードの切り替え（ダッシュボードから）。"""
+    mode = (request.get_json(silent=True) or {}).get("mode")
+    if mode not in MOTION_CHECK_MODES:
+        return jsonify({"ok": False, "reason": "bad mode"}), 400
+    before = motion_check_mode()
+    try:
+        settings.set("motion_check_mode", mode)
+    except OSError as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+    if mode != before:
+        state.log(f"🔀 昼間のカメラ判定を {CHECK_MODE_LABEL[before]} → {CHECK_MODE_LABEL[mode]} に切り替え（Web操作）")
+        log_event("check_mode", mode=mode, before=before, source="web")
+    return jsonify({"ok": True, "mode": mode})
 
 
 @app.route("/api/photos")
@@ -1217,28 +1369,46 @@ DASHBOARD = """
     .shot-set:last-child { border-bottom:none; padding-bottom:0; }
     .shot-time { font-size:.8rem; color:#cbd5e1; margin-bottom:6px; font-family:monospace; }
     .shot-pair { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    .shot { position:relative; display:block; aspect-ratio:4/3; border-radius:8px; overflow:hidden; background:#0f172a; }
+    .shot { position:relative; display:block; aspect-ratio:16/9; border-radius:8px; overflow:hidden; background:#0f172a; }
     .shot img { width:100%; height:100%; object-fit:cover; display:block; }
     .shot .tag { position:absolute; left:6px; bottom:6px; font-size:.65rem; padding:2px 6px; border-radius:4px; background:rgba(15,23,42,.8); color:#e2e8f0; }
     .shot.none { display:flex; align-items:center; justify-content:center; color:#64748b; font-size:.75rem; }
     .muted { color:#64748b; font-size:.8rem; }
+    .modes { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
+    .mode-btn { padding:12px 6px; border:2px solid #334155; border-radius:10px; background:#0f172a; color:#cbd5e1;
+      font:inherit; font-weight:700; cursor:pointer; }
+    .mode-btn.on { border-color:#60a5fa; background:#1d4ed8; color:#fff; }
+    .mode-btn:disabled { opacity:.6; }
+    .mode-desc { color:#94a3b8; font-size:.78rem; margin-top:8px; line-height:1.5; }
     .foot { color:#64748b; font-size:.7rem; margin-top:16px; text-align:center; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>📊 猫撃退システム ダッシュボード</h1>
-    <div class="sub"><a href="/">← 操作画面へ戻る</a> ・ 10秒ごとに自動更新</div>
+    <div class="sub"><a href="/">← 操作画面へ戻る</a> ・ <a href="/review">🧪 判定レビュー</a> ・ 10秒ごとに自動更新</div>
 
     <div class="grid">
       <div class="tile"><div class="label">本日の稼働時間</div><div class="val" id="t_armed">-</div></div>
       <div class="tile"><div class="label">本日の検知</div><div class="val" id="t_detect">-<span class="unit"> 件</span></div></div>
       <div class="tile"><div class="label">本日の散水</div><div class="val" id="t_spray">-<span class="unit"> 件</span></div></div>
-      <div class="tile"><div class="label">本日の誤検知見送り</div><div class="val" id="t_reject">-<span class="unit"> 件</span></div></div>
+      <div class="tile"><div class="label" id="t_reject_label">本日の誤検知見送り</div><div class="val" id="t_reject">-<span class="unit"> 件</span></div></div>
+      <div class="tile"><div class="label">本日の散水間隔延長</div><div class="val" id="t_throttle">-<span class="unit"> 回</span></div></div>
       <div class="tile"><div class="label">判定モード</div><div class="val" id="t_light" style="font-size:1.1rem;">-</div><div class="label" id="t_bright"></div></div>
       <div class="tile"><div class="label">本日の一時OFF</div><div class="val" id="t_pause">-<span class="unit"> 回</span></div></div>
       <div class="tile"><div class="label">CPU温度</div><div class="val" id="t_temp">-</div></div>
       <div class="tile"><div class="label">連続稼働</div><div class="val" id="t_uptime" style="font-size:1.2rem;">-</div></div>
+    </div>
+
+    <div class="section">
+      <h2>☀️ 昼間のカメラ判定</h2>
+      <div class="modes">
+        <button class="mode-btn" data-mode="trial" onclick="setCheckMode('trial')">🧪 お試し</button>
+        <button class="mode-btn" data-mode="enforce" onclick="setCheckMode('enforce')">✅ 本番</button>
+        <button class="mode-btn" data-mode="off" onclick="setCheckMode('off')">OFF</button>
+      </div>
+      <div class="mode-desc" id="mode_desc">-</div>
+      <div class="mode-desc"><a href="/review">🧪 判定レビューで結果を確認する →</a></div>
     </div>
 
     <div class="section">
@@ -1256,7 +1426,7 @@ DASHBOARD = """
       <h2>日別 明細</h2>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>日付</th><th>稼働時間</th><th>検知</th><th>散水</th><th>見送り</th><th>一時OFF</th><th>復帰</th><th>OFF</th><th>起動</th></tr></thead>
+          <thead><tr><th>日付</th><th>稼働時間</th><th>検知</th><th>散水</th><th>見送り</th><th>見送り判定<br>(お試し)</th><th>間隔延長</th><th>一時OFF</th><th>復帰</th><th>OFF</th><th>起動</th></tr></thead>
           <tbody id="tbody"></tbody>
         </table>
       </div>
@@ -1280,7 +1450,11 @@ async function refresh() {
     document.getElementById('t_detect').innerHTML   = (today.detections||0) + '<span class="unit"> 件</span>';
     document.getElementById('t_spray').innerHTML    = (today.sprays||0) + '<span class="unit"> 件</span>';
     document.getElementById('t_pause').innerHTML    = (today.pauses||0) + '<span class="unit"> 回</span>';
-    document.getElementById('t_reject').innerHTML   = (today.rejects||0) + '<span class="unit"> 件</span>';
+    renderCheckMode(s.check_mode);
+    const trial = s.check_mode === 'trial';
+    document.getElementById('t_reject_label').textContent = trial ? '本日の見送り判定（🧪お試し・散水はした）' : '本日の誤検知見送り';
+    document.getElementById('t_reject').innerHTML   = ((trial ? today.trial_rejects : today.rejects)||0) + '<span class="unit"> 件</span>';
+    document.getElementById('t_throttle').innerHTML = (today.throttles||0) + '<span class="unit"> 回</span>';
     const light = s.light || {};
     const LIGHT_LABEL = { day: '☀️ 昼（カメラ確認）', night: '🌙 夜（PIRのみ）', unknown: '📷 カメラ無し（PIRのみ）', off: '確認OFF（PIRのみ）' };
     document.getElementById('t_light').textContent = LIGHT_LABEL[light.mode] || '-';
@@ -1310,12 +1484,37 @@ async function refresh() {
     // 明細テーブル（新しい日付を上に）
     document.getElementById('tbody').innerHTML = days.slice().reverse().map(d =>
       '<tr><td>'+d.date+'</td><td>'+d.armed_str+'</td><td>'+d.detections+'</td><td>'+d.sprays
-      +'</td><td>'+d.rejects+'</td><td>'+d.pauses+'</td><td>'+d.resumes+'</td><td>'+d.offs+'</td><td>'+d.startups+'</td></tr>'
+      +'</td><td>'+d.rejects+'</td><td>'+d.trial_rejects+'</td><td>'+d.throttles+'</td><td>'+d.pauses+'</td><td>'+d.resumes+'</td><td>'+d.offs+'</td><td>'+d.startups+'</td></tr>'
     ).join('');
   } catch (e) {
     document.getElementById('t_armed').textContent = '接続不可';
   }
   refreshShots();
+}
+const MODE_DESC = {
+  trial: '🧪 お試し：昼はカメラで「動きがあったか」を判定して記録・撮影するだけ。<b>判定結果は使わず、散水はPIRの反応どおり</b>に行います。',
+  enforce: '✅ 本番：昼にカメラで<b>「動きなし」と判定したら散水を見送ります</b>（日光などによるPIRの誤検知対策）。夜・カメラ不調時はPIRのみ。',
+  off: 'OFF：カメラ判定をしません。昼も夜もPIRだけで散水します（写真は撮影します）。',
+};
+function renderCheckMode(mode) {
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  document.getElementById('mode_desc').innerHTML = MODE_DESC[mode] || '-';
+}
+async function setCheckMode(mode) {
+  if (mode === 'enforce' && !confirm('本番モードにすると、昼にカメラで「動きなし」と判定した時は散水しなくなります。よろしいですか？')) return;
+  const btns = document.querySelectorAll('.mode-btn');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await (await fetch('/api/check_mode', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }) })).json();
+    if (!r.ok) throw new Error(r.reason);
+    renderCheckMode(r.mode);
+  } catch (e) {
+    alert('切り替えに失敗しました');
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+  refresh();
 }
 function shotHtml(src, label) {
   if (!src) return '<div class="shot none">' + label + '：撮影なし</div>';
@@ -1354,6 +1553,403 @@ setInterval(refresh, 10000);
 @app.route("/dashboard")
 def dashboard():
     return render_template_string(DASHBOARD)
+
+
+# ============================================================
+#  判定レビュー（昼間の誤検知フィルタの結果確認・正解ラベル付け）
+# ============================================================
+class ReviewLabels:
+    """判定ごとの正解ラベル {"YYYY-MM-DD/HHMMSS": "cat" | "none" | "unsure"} を小さなJSONに保存する。
+    人がボタンを押した時だけ書くので、その都度アトミックに書き込む。"""
+
+    VALID = ("cat", "none", "unsure")
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.data = data if isinstance(data, dict) else {}
+        except (FileNotFoundError, ValueError):
+            self.data = {}
+
+    def all(self):
+        with self.lock:
+            return dict(self.data)
+
+    def set(self, item_id, label):
+        with self.lock:
+            if label is None:
+                self.data.pop(item_id, None)
+            else:
+                self.data[item_id] = label
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+
+
+review_labels = ReviewLabels(LABELS_PATH)
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_REVIEW_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/\d{6}$")
+_PHOTO_ID_RE = re.compile(r"photos/(\d{4}-\d{2}-\d{2})/(\d{6})_")
+
+
+def _review_items(date=None):
+    """events.jsonl から昼間の判定（お試し・本番）を集める。
+    date指定時は、JSONを解析する前に文字列でその日の行だけに絞るので軽い。
+    戻り値: (判定の一覧（古い順）, 夜間にPIRのみで散水した件数)"""
+    items, night = [], 0
+    date_key = f'"ts": "{date}' if date else None
+    labels = review_labels.all()
+    try:
+        f = open(EVENTS_PATH, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return items, night
+    with f:
+        for line in f:
+            if date_key and date_key not in line:
+                continue
+            if '"verdict"' not in line and '"night"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") not in ("detect", "reject"):
+                continue
+            if "verdict" not in ev:
+                night += ev.get("light") == "night"
+                continue
+            m = _PHOTO_ID_RE.search(ev.get("photo") or "")
+            item_id = f"{m.group(1)}/{m.group(2)}" if m else None
+            spray_photo = None
+            if m and ev["type"] == "detect":
+                rel = f"photos/{m.group(1)}/{m.group(2)}_2_spray.jpg"
+                if os.path.isfile(os.path.join(BASE_DIR, rel)):
+                    spray_photo = rel
+            items.append({
+                "id": item_id,
+                "ts": ev.get("ts"),
+                "verdict": ev.get("verdict"),
+                "check_mode": ev.get("check_mode"),
+                "ratio": ev.get("ratio"),
+                "sprayed": ev["type"] == "detect",
+                "photo": ev.get("photo"),
+                "photo_b": ev.get("photo_b"),
+                "spray_photo": spray_photo,
+                "label": labels.get(item_id) if item_id else None,
+            })
+    return items, night
+
+
+@app.route("/api/review")
+def api_review():
+    date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    if not _DATE_RE.match(date):
+        return jsonify({"error": "bad date"}), 400
+    items, night = _review_items(date)
+    try:
+        dates = sorted((d for d in os.listdir(PHOTO_DIR) if _DATE_RE.match(d)), reverse=True)
+    except OSError:
+        dates = []
+    return jsonify({
+        "date": date,
+        "dates": dates,
+        "check_mode": motion_check_mode(),
+        "threshold": MOTION_MIN_RATIO,
+        "items": items,
+        "night_count": night,
+    })
+
+
+@app.route("/api/review/labeled")
+def api_review_labeled():
+    """全期間のラベル済み判定（集計・しきい値シミュレーション用に必要な項目だけ）。"""
+    items, _ = _review_items()
+    return jsonify({"items": [
+        {"id": it["id"], "ratio": it["ratio"], "verdict": it["verdict"], "label": it["label"]}
+        for it in items if it["label"]
+    ]})
+
+
+@app.route("/api/review/label", methods=["POST"])
+def api_review_label():
+    body = request.get_json(silent=True) or {}
+    item_id, label = body.get("id"), body.get("label")
+    if not isinstance(item_id, str) or not _REVIEW_ID_RE.match(item_id):
+        return jsonify({"ok": False, "reason": "bad id"}), 400
+    if label is not None and label not in ReviewLabels.VALID:
+        return jsonify({"ok": False, "reason": "bad label"}), 400
+    try:
+        review_labels.set(item_id, label)
+    except OSError as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+    return jsonify({"ok": True})
+
+
+REVIEW_PAGE = """<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>猫撃退システム 判定レビュー</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      margin: 0; padding: 20px 14px; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; margin: 0 0 2px; }
+    h2 { font-size: .95rem; margin: 0 0 10px; }
+    a { color: #60a5fa; text-decoration: none; }
+    .sub { color: #94a3b8; font-size: .8rem; margin-bottom: 14px; }
+    .section { background: #1e293b; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+    .banner { font-size: .85rem; line-height: 1.6; }
+    .banner b { color: #fbbf24; }
+    .muted { color: #94a3b8; font-size: .78rem; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button, select { font: inherit; color: #e2e8f0; background: #334155; border: 1px solid #475569;
+      border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+    button:active { transform: scale(.97); }
+    .chip.on { background: #2563eb; border-color: #3b82f6; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-top: 10px; }
+    .stat { background: #0f172a; border-radius: 10px; padding: 10px; }
+    .stat .v { font-size: 1.3rem; font-weight: 700; }
+    .stat .l { font-size: .7rem; color: #94a3b8; }
+    .matrix-wrap { overflow-x: auto; }
+    table.matrix { border-collapse: collapse; font-size: .82rem; margin-top: 8px; min-width: 460px; }
+    .matrix th, .matrix td { border: 1px solid #334155; padding: 8px 10px; text-align: center; }
+    .matrix th { color: #94a3b8; font-weight: 600; }
+    .good { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+    input[type=range] { width: 100%; max-width: 420px; }
+    .card { background: #1e293b; border-radius: 14px; padding: 12px; margin-bottom: 10px; }
+    .card-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .time { font-family: monospace; font-size: .95rem; }
+    .badge { font-size: .72rem; padding: 3px 8px; border-radius: 999px; }
+    .b-pass { background: #14532d; color: #4ade80; }
+    .b-reject { background: #713f12; color: #fbbf24; }
+    .b-enforced { background: #7f1d1d; color: #fca5a5; }
+    .b-na { background: #334155; color: #cbd5e1; }
+    .ratio { font-size: .75rem; color: #cbd5e1; }
+    .shots { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .shot { position: relative; display: block; aspect-ratio: 16/9; background: #0f172a; border-radius: 8px; overflow: hidden; }
+    .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .shot .tag { position: absolute; left: 4px; bottom: 4px; font-size: .62rem; padding: 1px 5px;
+      border-radius: 4px; background: rgba(15,23,42,.85); }
+    .shot.none { display: flex; align-items: center; justify-content: center; font-size: .7rem; color: #64748b; }
+    .labels { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .labels button { flex: 1; min-width: 90px; }
+    .labels button.sel-cat { background: #9a3412; border-color: #fb923c; }
+    .labels button.sel-none { background: #1e3a8a; border-color: #60a5fa; }
+    .labels button.sel-unsure { background: #475569; border-color: #cbd5e1; }
+    .more { width: 100%; padding: 12px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🧪 判定レビュー</h1>
+  <div class="sub"><a href="/">← 操作画面</a> ・ <a href="/dashboard">📊 ダッシュボード</a></div>
+
+  <div class="section banner" id="banner">読み込み中...</div>
+
+  <div class="section">
+    <div class="row">
+      <button onclick="shiftDate(1)">◀ 前の日</button>
+      <select id="date" onchange="load(this.value)"></select>
+      <button onclick="shiftDate(-1)">次の日 ▶</button>
+      <button onclick="load(currentDate)">🔄 再読み込み</button>
+    </div>
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <div class="section">
+    <h2>正解ラベルの集計</h2>
+    <div class="row">
+      <button class="chip scope on" data-scope="day" onclick="setScope('day')">この日</button>
+      <button class="chip scope" data-scope="all" onclick="setScope('all')">全期間</button>
+    </div>
+    <div style="margin-top:12px;">
+      <div class="muted">しきい値（変化がこれ未満なら「動きなし」）：<b id="thr_val"></b>
+        <span id="thr_note"></span></div>
+      <input type="range" id="thr" min="0" max="0.03" step="0.0005" oninput="renderMatrix()">
+      <div class="muted">スライダーを動かすと「しきい値をこの値にしていたら」の結果に置き換わります（設定は変わりません）</div>
+    </div>
+    <div class="matrix-wrap"><table class="matrix" id="matrix"></table></div>
+    <div class="muted" id="rates" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="section">
+    <div class="row" id="filters">
+      <button class="chip on" data-f="all" onclick="setFilter('all')">すべて</button>
+      <button class="chip" data-f="reject" onclick="setFilter('reject')">動きなし判定</button>
+      <button class="chip" data-f="pass" onclick="setFilter('pass')">動きあり判定</button>
+      <button class="chip" data-f="unlabeled" onclick="setFilter('unlabeled')">未ラベル</button>
+      <button class="chip" data-f="cat" onclick="setFilter('cat')">🐱 猫いた</button>
+    </div>
+    <div class="muted" style="margin-top:8px;">①検知の瞬間と②0.3秒後を見比べて、猫（動物）が写っていれば「🐱 猫いた」を押してください。もう一度押すと取り消せます。</div>
+  </div>
+
+  <div id="list"></div>
+  <button class="more" id="more" onclick="renderMore()" hidden>もっと見る</button>
+</div>
+
+<script>
+const PAGE = 30;
+let data = null, currentDate = null, filter = 'all', scope = 'day', shown = 0, allLabeled = null;
+
+const pct = r => (r * 100).toFixed(2) + '%';
+function itemsInFilter() {
+  return data.items.slice().reverse().filter(it => {
+    if (filter === 'reject') return it.verdict === 'reject';
+    if (filter === 'pass') return it.verdict === 'pass';
+    if (filter === 'unlabeled') return it.id && !it.label;
+    if (filter === 'cat') return it.label === 'cat';
+    return true;
+  });
+}
+
+async function load(date) {
+  const q = date ? '?date=' + date : '';
+  data = await (await fetch('/api/review' + q)).json();
+  currentDate = data.date;
+  const sel = document.getElementById('date');
+  const dates = data.dates.includes(data.date) ? data.dates : [data.date].concat(data.dates);
+  sel.innerHTML = dates.map(d => '<option' + (d === data.date ? ' selected' : '') + '>' + d + '</option>').join('');
+  const thr = document.getElementById('thr');
+  if (thr.dataset.init !== '1') { thr.value = data.threshold; thr.dataset.init = '1'; }
+  renderBanner(); renderStats(); renderMatrix(); resetList();
+}
+
+function shiftDate(step) {
+  const opts = Array.from(document.getElementById('date').options).map(o => o.value);
+  const i = opts.indexOf(currentDate) + step;
+  if (i >= 0 && i < opts.length) load(opts[i]);
+}
+
+function renderBanner() {
+  const mode = { trial: '🧪 <b>お試しモード</b>：昼間はカメラで判定して記録するだけで、散水は止めていません',
+                 enforce: '✅ <b>本番モード</b>：昼間は「動きなし」と判定したら散水を見送ります',
+                 off: '判定OFF：PIRのみで動作中' }[data.check_mode] || data.check_mode;
+  document.getElementById('banner').innerHTML = mode
+    + '<br><span class="muted">現在のしきい値 ' + pct(data.threshold)
+    + '（画面の変化がこれ未満なら「動きなし」）。夜間はカメラ判定の対象外です。</span>';
+}
+
+function renderStats() {
+  const it = data.items;
+  const c = v => it.filter(x => x.verdict === v).length;
+  const labeled = it.filter(x => x.label).length;
+  const tiles = [
+    ['昼の判定', it.length], ['動きあり', c('pass')], ['動きなし', c('reject')],
+    ['確認不能', c('unavailable')], ['夜（PIRのみ・対象外）', data.night_count], ['ラベル済み', labeled + ' / ' + it.filter(x => x.id).length],
+  ];
+  document.getElementById('stats').innerHTML = tiles.map(t =>
+    '<div class="stat"><div class="v">' + t[1] + '</div><div class="l">' + t[0] + '</div></div>').join('');
+}
+
+async function setScope(s) {
+  scope = s;
+  document.querySelectorAll('.scope').forEach(b => b.classList.toggle('on', b.dataset.scope === s));
+  if (s === 'all') allLabeled = (await (await fetch('/api/review/labeled')).json()).items;
+  renderMatrix();
+}
+
+function renderMatrix() {
+  const thr = parseFloat(document.getElementById('thr').value);
+  document.getElementById('thr_val').textContent = pct(thr);
+  document.getElementById('thr_note').textContent = Math.abs(thr - data.threshold) < 1e-9 ? '（現在の設定）' : '（現在の設定は ' + pct(data.threshold) + '）';
+  const src = (scope === 'all' && allLabeled) ? allLabeled : data.items;
+  const labeled = src.filter(x => (x.label === 'cat' || x.label === 'none') && x.ratio != null);
+  const m = { cat: { pass: 0, reject: 0 }, none: { pass: 0, reject: 0 } };
+  labeled.forEach(x => { m[x.label][x.ratio >= thr ? 'pass' : 'reject']++; });
+  const cell = (n, cls, txt) => '<td class="' + cls + '"><b>' + n + '</b><br><span class="muted">' + txt + '</span></td>';
+  document.getElementById('matrix').innerHTML =
+    '<tr><th></th><th>判定：動きあり（散水）</th><th>判定：動きなし（見送り）</th></tr>'
+    + '<tr><th>🐱 猫いた</th>' + cell(m.cat.pass, 'good', '正しく散水') + cell(m.cat.reject, 'bad', '⚠️ 見逃し') + '</tr>'
+    + '<tr><th>🚫 いなかった</th>' + cell(m.none.pass, 'warn', '誤検知のまま散水') + cell(m.none.reject, 'good', '誤検知を防止') + '</tr>';
+  const cats = m.cat.pass + m.cat.reject, nones = m.none.pass + m.none.reject;
+  document.getElementById('rates').innerHTML = labeled.length === 0
+    ? 'まだラベルがありません（「🐱 猫いた」「🚫 いなかった」を付けるとここに集計されます）'
+    : '見逃し率 <b class="' + (m.cat.reject ? 'bad' : 'good') + '">' + (cats ? Math.round(m.cat.reject / cats * 100) + '%' : '-') + '</b>'
+      + '（猫いた ' + cats + '件中 ' + m.cat.reject + '件）　／　誤検知カット率 <b class="good">'
+      + (nones ? Math.round(m.none.reject / nones * 100) + '%' : '-') + '</b>（いなかった ' + nones + '件中 ' + m.none.reject + '件）';
+}
+
+function setFilter(f) {
+  filter = f;
+  document.querySelectorAll('#filters .chip').forEach(b => b.classList.toggle('on', b.dataset.f === f));
+  resetList();
+}
+
+function resetList() { shown = 0; document.getElementById('list').innerHTML = ''; renderMore(); }
+
+function shot(src, label) {
+  if (!src) return '<div class="shot none">' + label + '：なし</div>';
+  return '<a class="shot" href="/' + src + '" target="_blank" rel="noopener"><img loading="lazy" src="/' + src
+    + '" alt="' + label + '" onerror="this.parentNode.classList.add(\\'none\\');this.remove()"><span class="tag">' + label + '</span></a>';
+}
+
+function badge(it) {
+  if (it.verdict === 'pass') return '<span class="badge b-pass">動きあり → 散水</span>';
+  if (it.verdict === 'reject' && !it.sprayed) return '<span class="badge b-enforced">動きなし → 見送り（本番）</span>';
+  if (it.verdict === 'reject') return '<span class="badge b-reject">🧪 動きなし（本番なら見送り）→ 散水はした</span>';
+  return '<span class="badge b-na">カメラ確認不能 → PIRのみで散水</span>';
+}
+
+function cardHtml(it, idx) {
+  const time = (it.ts || '').slice(11);
+  const ratio = it.ratio == null ? '' : '<span class="ratio">変化 ' + pct(it.ratio) + '（しきい値 ' + pct(data.threshold) + '）</span>';
+  const btn = (val, txt) => '<button data-idx="' + idx + '" data-val="' + val + '" class="' + (it.label === val ? 'sel-' + val : '')
+    + '" onclick="setLabel(this)">' + txt + '</button>';
+  const labels = it.id ? '<div class="labels">' + btn('cat', '🐱 猫いた') + btn('none', '🚫 いなかった') + btn('unsure', '❓ 不明') + '</div>'
+    : '<div class="muted" style="margin-top:6px;">写真が無いためラベル付けできません</div>';
+  return '<div class="card" id="card-' + idx + '"><div class="card-head"><span class="time">' + time + '</span>' + badge(it) + ratio + '</div>'
+    + '<div class="shots">' + shot(it.photo, '① 検知') + shot(it.photo_b, '② 0.3秒後') + shot(it.spray_photo, '③ 散水') + '</div>'
+    + labels + '</div>';
+}
+
+let listed = [];
+function renderMore() {
+  if (shown === 0) listed = itemsInFilter();
+  const chunk = listed.slice(shown, shown + PAGE);
+  const html = chunk.map((it, i) => cardHtml(it, shown + i)).join('');
+  document.getElementById('list').insertAdjacentHTML('beforeend',
+    shown === 0 && !chunk.length ? '<div class="section muted">該当する判定はありません</div>' : html);
+  shown += chunk.length;
+  const more = document.getElementById('more');
+  more.hidden = shown >= listed.length;
+  more.textContent = 'もっと見る（残り ' + (listed.length - shown) + ' 件）';
+}
+
+async function setLabel(btn) {
+  const it = listed[parseInt(btn.dataset.idx, 10)];
+  const val = it.label === btn.dataset.val ? null : btn.dataset.val;  // 同じボタンで取り消し
+  const r = await fetch('/api/review/label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: it.id, label: val }) });
+  if (!r.ok) { alert('保存に失敗しました'); return; }
+  it.label = val;
+  btn.parentNode.querySelectorAll('button').forEach(b => { b.className = (b.dataset.val === val ? 'sel-' + val : ''); });
+  if (allLabeled) {
+    allLabeled = allLabeled.filter(x => x.id !== it.id);
+    if (val) allLabeled.push({ id: it.id, ratio: it.ratio, verdict: it.verdict, label: val });
+  }
+  renderStats(); renderMatrix();
+}
+
+load();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/review")
+def review_page():
+    # Jinjaの記法と衝突しないよう、テンプレート処理せずそのまま返す
+    return REVIEW_PAGE
 
 
 # ============================================================

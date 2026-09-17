@@ -2,6 +2,8 @@
 stats.json
 events.jsonl
 photos/
+review_labels.json
+runtime_settings.json
 *.tmp
 
 # === ローカル専用（公開しない）===
