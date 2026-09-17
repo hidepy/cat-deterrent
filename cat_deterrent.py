@@ -7,9 +7,10 @@
   - PIRセンサー  : 動体検知
   - リレー       : ダイヤフラムポンプ電源のON/OFF（散水）
   - アクティブブザー: 散水直前の警告ビープ
+  - USBカメラ    : 検知時・散水時の様子を撮影（任意。無くても動作する）
 
 動作の流れ（ON時）:
-  動体検知 → ビープ1秒 → 1秒待機 → 散水 → 5秒クールタイム
+  動体検知 → 📷撮影 → 0.5秒の溜め → ビープ1秒 → 1秒待機 → 散水（📷撮影）→ 5秒クールタイム
 
 Webアプリ（Flask）から以下の3状態を制御できます:
   - ON     : 通常稼働
@@ -23,6 +24,7 @@ Webアプリ（Flask）から以下の3状態を制御できます:
 import os
 import json
 import time
+import shutil
 import signal
 import atexit
 import threading
@@ -31,6 +33,11 @@ from collections import deque
 
 from flask import Flask, jsonify, render_template_string
 from gpiozero import MotionSensor, OutputDevice
+
+try:
+    import cv2  # USBカメラ用（sudo apt install python3-opencv）。無ければ撮影だけスキップ
+except ImportError:
+    cv2 = None
 
 # ============================================================
 #  設定（ここを変えれば挙動を調整できます）
@@ -43,6 +50,7 @@ BUZZER_PIN = 27  # アクティブブザー I/O (GPIO 27 / 13番ピン)
                  #   「gpio=27=op,dh」を追記し、起動時からピンをHIGH(=静音)に固定すること。
 
 # --- タイミング（秒）---
+PRE_BEEP_DELAY = 0.5     # 検知→ビープまでの「溜め」（この頭で1枚目を撮影）
 BEEP_DURATION = 1.0      # ビープを鳴らす長さ
 WAIT_AFTER_BEEP = 1.0    # ビープ後、散水までの待機
 SPRAY_DURATION = 4.0     # 散水（リレーON）の長さ
@@ -52,7 +60,7 @@ TEST_PUMP_DURATION = 5.0 # テストポンプ（呼び水・動作確認用）�
 
 # --- 安全機構 ---
 # 暴走検知：直近RUNAWAY_WINDOW秒で自動散水がRUNAWAY_MAX回以上 → 故障モードにラッチ。
-#   （1サイクル最短≒11秒＝最大でも約6回/分なので、6回は「その1分ずっと反応し続けた」異常状態）
+#   （1サイクル最短≒11.5秒＝60秒の窓に入るのは最大6回なので、6回は「その1分ずっと反応し続けた」異常状態）
 #   ※手動のテストポンプ（呼び水）はこの回数に含めない。
 RUNAWAY_MAX = 6
 RUNAWAY_WINDOW = 60
@@ -72,6 +80,15 @@ RELAY_ACTIVE_HIGH = True
 #   active_high=False + initial_value=False で off=HIGH=静音／.on()=LOW=鳴る、となります。
 BUZZER_ACTIVE_HIGH = False
 
+# --- USBカメラ（撮影）---
+CAMERA_ENABLED = True       # Falseでカメラ機能を丸ごと無効化
+CAMERA_DEVICE = 0           # /dev/video0
+CAMERA_WIDTH = 640          # 撮影解像度。これより大きい画像が来たら縮小して保存
+CAMERA_HEIGHT = 480
+PHOTO_JPEG_QUALITY = 70     # JPEG画質(0-100)。640x480・70で1枚およそ30〜80KB
+SPRAY_SHOT_DELAY = 0.5      # ポンプON→2枚目を撮るまでの遅れ（ノズルから水が出るまでの時間）
+PHOTO_RETENTION_DAYS = 30   # これより古い日付フォルダは自動削除（SD容量の保護）
+
 # --- Webサーバー ---
 HOST = "0.0.0.0"   # LAN内のどの端末からもアクセス可能に
 PORT = 5000          # ポート5000番に変更
@@ -83,6 +100,7 @@ SENSOR_WARMUP = 5
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")    # 1日ごとの集計（小さいJSON）
 EVENTS_PATH = os.path.join(BASE_DIR, "events.jsonl")  # 生イベントログ（1行1JSON）
+PHOTO_DIR = os.path.join(BASE_DIR, "photos")          # 撮影画像（photos/YYYY-MM-DD/*.jpg）
 STATS_FLUSH_INTERVAL = 60   # 稼働時間の集計をディスクへ書く間隔（秒）。SD保護のため大きめ
 DASHBOARD_DAYS = 14         # ダッシュボードに表示する日数
 # CPU温度のしきい値（ダッシュボードの色分け・℃）
@@ -256,6 +274,141 @@ def read_cpu_temp():
         return None
 
 
+# ============================================================
+#  USBカメラ（撮影）
+# ============================================================
+class Camera:
+    """USBカメラを常時オープンし、撮影要求が来たら「その瞬間の」1枚を保存する。
+    - 撮影のたびにopenすると0.5〜1秒かかり露出も合わず暗くなるため、常時オープンにしておく。
+    - 裏ではgrab()（デコードなし＝軽い）だけを回してバッファを最新に保ち、
+      撮影要求があった時だけretrieve()でデコードする。
+    - capture()は要求を積むだけで即戻る。JPEG圧縮・書き込みも別スレッド。
+      → カメラが無い／抜けた／SDが遅い場合でも、散水シーケンスのタイミングには影響しない。"""
+
+    RETRY_SEC = 10        # カメラが見つからない時の再接続間隔
+    MAX_GRAB_FAILS = 20   # 連続でこの回数grabに失敗したら切断とみなす
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = []      # 撮影待ちの保存先（絶対パス）
+        self._running = False   # 今フレームを取得できている状態か
+
+    def start(self):
+        if not CAMERA_ENABLED:
+            return
+        if cv2 is None:
+            state.log("📷 OpenCV未導入のため撮影なし（sudo apt install python3-opencv）")
+            return
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def capture(self, taken_for, label):
+        """撮影を要求する（非ブロッキング）。受け付けたら保存先の相対パス、できなければNone。"""
+        day = taken_for.strftime("%Y-%m-%d")
+        name = f"{taken_for.strftime('%H%M%S')}_{label}.jpg"
+        path = os.path.join(PHOTO_DIR, day, name)
+        with self._lock:
+            if not self._running:
+                return None
+            self._pending.append(path)
+        return f"photos/{day}/{name}"
+
+    def _open(self):
+        cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        # MJPGにするとUSB帯域・CPUともに軽い。解像度は控えめに（容量節約）
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _loop(self):
+        announced = None  # 直前にログした状態（同じ内容を連投しないため）
+        while not shutdown_event.is_set():
+            cap = self._open()
+            if cap is None:
+                if announced != "missing":
+                    state.log(f"📷 カメラが見つかりません（/dev/video{CAMERA_DEVICE}）。{self.RETRY_SEC}秒ごとに再試行")
+                    announced = "missing"
+                shutdown_event.wait(self.RETRY_SEC)
+                continue
+
+            fails = 0
+            while not shutdown_event.is_set() and fails < self.MAX_GRAB_FAILS:
+                if not cap.grab():
+                    fails += 1
+                    with self._lock:
+                        self._running = False
+                    time.sleep(0.1)
+                    continue
+                fails = 0
+                with self._lock:
+                    self._running = True
+                    pending, self._pending = self._pending, []
+                if announced != "ready":
+                    state.log("📷 カメラ準備OK")
+                    announced = "ready"
+                if pending:
+                    ok, frame = cap.retrieve()
+                    if ok:
+                        for path in pending:
+                            threading.Thread(target=self._save, args=(frame.copy(), path), daemon=True).start()
+
+            with self._lock:
+                self._running = False
+                self._pending = []
+            cap.release()
+            if not shutdown_event.is_set():
+                state.log("📷 カメラとの接続が切れました。再接続を試みます")
+                announced = "lost"
+                shutdown_event.wait(1)
+
+    def _save(self, frame, path):
+        """縮小（必要なら）＋時刻の焼き込み＋JPEG圧縮して保存。"""
+        try:
+            h, w = frame.shape[:2]
+            if w > CAMERA_WIDTH:
+                frame = cv2.resize(frame, (CAMERA_WIDTH, int(h * CAMERA_WIDTH / w)), interpolation=cv2.INTER_AREA)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for color, thick in (((0, 0, 0), 3), ((255, 255, 255), 1)):  # 縁取りで明暗どちらでも読める
+                cv2.putText(frame, stamp, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thick, cv2.LINE_AA)
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, PHOTO_JPEG_QUALITY])
+            if not ok:
+                raise OSError("JPEGエンコード失敗")
+
+            day_dir = os.path.dirname(path)
+            if not os.path.isdir(day_dir):
+                os.makedirs(day_dir, exist_ok=True)
+                _cleanup_old_photos()  # 日付が変わった最初の1枚のときだけ掃除
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(buf.tobytes())
+            os.replace(tmp, path)  # 書きかけのファイルを残さない
+        except Exception as e:
+            print(f"[camera] 保存失敗 {path}: {e}", flush=True)
+
+
+def _cleanup_old_photos():
+    """PHOTO_RETENTION_DAYSより古い日付フォルダ（YYYY-MM-DD）を削除する。"""
+    limit = datetime.now().date() - timedelta(days=PHOTO_RETENTION_DAYS)
+    try:
+        entries = os.listdir(PHOTO_DIR)
+    except OSError:
+        return
+    for name in entries:
+        try:
+            day = datetime.strptime(name, "%Y-%m-%d").date()
+        except ValueError:
+            continue  # 日付フォルダ以外には触らない
+        if day < limit:
+            shutil.rmtree(os.path.join(PHOTO_DIR, name), ignore_errors=True)
+
+
+camera = Camera()
+
+
 # --- 安全機構：故障モードと最大ON時間ウォッチドッグ ---------------------
 def enter_fault(reason):
     """故障モードに入る（自動散水を停止しラッチ）。ポンプ・ブザーも即停止。"""
@@ -368,12 +521,17 @@ def run_spray_sequence():
         if state.mode != "ON" or shutdown_event.is_set() or state.busy or state.fault:
             return
         state.busy = True
-        state.last_motion = datetime.now()
+        detected_at = datetime.now()
+        state.last_motion = detected_at
 
     try:
-        state.log("★ 動体を検知 → 警告ビープ")
+        # 1枚目：検知した瞬間（撮影は非ブロッキング。カメラが無ければNone）
+        detect_photo = camera.capture(detected_at, "1_detect")
+        state.log("★ 動体を検知 → 撮影・警告ビープ" if detect_photo else "★ 動体を検知 → 警告ビープ")
         stats.incr("detections")
-        log_event("detect")
+        log_event("detect", **({"photo": detect_photo} if detect_photo else {}))
+        time.sleep(PRE_BEEP_DELAY)  # 溜め
+
         buzzer.on()
         time.sleep(BEEP_DURATION)
         buzzer.off()
@@ -382,7 +540,11 @@ def run_spray_sequence():
 
         state.log("💧 散水開始")
         relay_on()
-        time.sleep(SPRAY_DURATION)
+        # 2枚目：水が出始めた瞬間（ポンプONからSPRAY_SHOT_DELAY後）。散水時間の合計は変えない
+        shot_delay = min(SPRAY_SHOT_DELAY, SPRAY_DURATION)
+        time.sleep(shot_delay)
+        spray_photo = camera.capture(detected_at, "2_spray")
+        time.sleep(SPRAY_DURATION - shot_delay)
         relay_off()
         state.log("散水終了 → クールタイム")
 
@@ -390,7 +552,7 @@ def run_spray_sequence():
             state.last_spray = datetime.now()
             state.spray_count += 1
         stats.incr("sprays")
-        log_event("spray", duration=SPRAY_DURATION)
+        log_event("spray", duration=SPRAY_DURATION, **({"photo": spray_photo} if spray_photo else {}))
 
         # --- 暴走検知（直近RUNAWAY_WINDOW秒の自動散水回数。手動テストは含めない）---
         now_m = time.monotonic()
@@ -936,6 +1098,7 @@ def main():
     # 監視スレッド・安全ウォッチドッグを開始
     threading.Thread(target=monitoring_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    camera.start()  # カメラは任意。無くても監視・散水はそのまま動く
 
     try:
         # reloader/デバッガはスレッド二重起動やGPIO競合の原因になるため無効化

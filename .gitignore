@@ -1,6 +1,7 @@
 # === 実行時データ（Pi上でのみ育つ。Gitに含めない＝同期で消さない）===
 stats.json
 events.jsonl
+photos/
 *.tmp
 
 # === ローカル専用（公開しない）===

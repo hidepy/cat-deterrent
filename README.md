@@ -8,7 +8,8 @@ Raspberry Pi を使った**猫撃退システム**。PIRセンサーで動体を
 
 ## ✨ 主な機能
 
-- **自動散水**：動体検知 → ビープ(1秒) → 1秒待機 → 散水 → クールタイム(5秒)
+- **自動散水**：動体検知 → 📷撮影 → 0.5秒の溜め → ビープ(1秒) → 1秒待機 → 散水（📷撮影） → クールタイム(5秒)
+- **撮影**（USBカメラ・任意）：検知の瞬間と散水の瞬間の2枚をJPEG圧縮して `photos/` に保存。カメラが無くても散水は通常どおり動作
 - **Web UI**（スマホ対応）：`ON` / `一時OFF`（5分停止して自動復帰）/ `OFF`（アプリ終了）
 - **テストポンプ駆動**ボタン：呼び水・動作確認用にポンプだけを数秒回す（ビープ・検知とは独立）
 - **ダッシュボード**：日別の稼働時間・検知/散水件数・一時OFF回数・CPU温度・棒グラフ
@@ -26,6 +27,7 @@ Raspberry Pi を使った**猫撃退システム**。PIRセンサーで動体を
 | リレーモジュール | ダイヤフラムポンプの電源ON/OFF |
 | ダイヤフラムポンプ + ホース | 散水 |
 | アクティブブザー（3.3〜5V / ローレベルトリガ） | 散水直前の警告音 |
+| USBカメラ（UVC対応・任意） | 検知時・散水時の撮影 |
 
 ### 配線（BCM番号）
 
@@ -50,10 +52,12 @@ Raspberry Pi OS（Bookworm 以降）では、`pip` の直接インストール�
 
 ```bash
 sudo apt update
-sudo apt install -y python3-flask python3-gpiozero python3-lgpio
+sudo apt install -y python3-flask python3-gpiozero python3-lgpio python3-opencv
 ```
 
 > `gpiozero` と `lgpio` は Raspberry Pi OS に最初から入っていることが多く、実質 Flask を足すだけで済む場合があります。
+> `python3-opencv` はカメラ撮影用です。未導入でも撮影がスキップされるだけで、他の機能は動作します。
+> USBカメラが認識されているかは `ls /dev/video*` で確認できます（通常は `/dev/video0`）。
 
 ---
 
@@ -105,6 +109,7 @@ sudo systemctl enable --now cat_deterrent
 
 | 定数 | 意味 | デフォルト |
 |---|---|---|
+| `PRE_BEEP_DELAY` | 検知（1枚目撮影）からビープまでの溜め | 0.5 秒 |
 | `BEEP_DURATION` | ビープの長さ | 1.0 秒 |
 | `WAIT_AFTER_BEEP` | ビープ後、散水までの待機 | 1.0 秒 |
 | `SPRAY_DURATION` | 散水の長さ | 4.0 秒 |
@@ -112,6 +117,11 @@ sudo systemctl enable --now cat_deterrent
 | `PAUSE_DURATION` | 「一時OFF」の停止時間 | 300 秒（5分） |
 | `TEST_PUMP_DURATION` | テストポンプの駆動時間 | 5.0 秒 |
 | `STATS_FLUSH_INTERVAL` | 集計のディスク書き込み間隔 | 60 秒 |
+| `CAMERA_ENABLED` | カメラ撮影のON/OFF | `True` |
+| `CAMERA_WIDTH` / `CAMERA_HEIGHT` | 撮影解像度（大きい画像は幅に合わせて縮小） | 640 × 480 |
+| `PHOTO_JPEG_QUALITY` | JPEG画質（下げるほど小さい） | 70 |
+| `SPRAY_SHOT_DELAY` | ポンプONから2枚目を撮るまでの遅れ | 0.5 秒 |
+| `PHOTO_RETENTION_DAYS` | 画像の保存日数（古い日付フォルダは自動削除） | 30 日 |
 
 ---
 
@@ -121,6 +131,10 @@ sudo systemctl enable --now cat_deterrent
 |---|---|
 | `events.jsonl` | 生イベントログ（1行1JSON） |
 | `stats.json` | 日別集計 |
+| `photos/YYYY-MM-DD/HHMMSS_1_detect.jpg` | 検知の瞬間の画像 |
+| `photos/YYYY-MM-DD/HHMMSS_2_spray.jpg` | 散水の瞬間の画像（`HHMMSS` は検知時刻なので2枚が組になる） |
+
+`events.jsonl` の `detect` / `spray` には、撮影できた場合 `"photo": "photos/..."` が付きます。
 
 > これらは Pi 上の実行時に自動生成される**永続データ**です。`.gitignore` で除外済み。フォルダを丸ごと同期する際は**上書き・削除しないよう**ご注意ください（`git pull` は安全、`git clean -fdx` は禁物）。
 
