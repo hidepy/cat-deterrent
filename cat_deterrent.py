@@ -1389,15 +1389,20 @@ def photo_file(filename):
 
 @app.route("/api/photos/day")
 def api_photos_day():
-    """指定日の全撮影セット。?date=YYYY-MM-DD（省略時は今日）。"""
+    """指定日の撮影セット。?date=YYYY-MM-DD&filter=spray|all（省略時はspray/今日）。"""
     date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    filter_mode = request.args.get("filter", "spray")
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
         return jsonify({"error": "invalid date"}), 400
+    sets = day_photo_sets(date_str)
+    if filter_mode != "all":
+        sets = [s for s in sets if s["kind"] == "散水あり"]
     return jsonify({
         "date": date_str,
-        "sets": day_photo_sets(date_str),
+        "filter": filter_mode,
+        "sets": sets,
         "available_dates": _available_photo_dates(),
     })
 
@@ -1438,9 +1443,9 @@ PHOTO_LOG_PAGE = """
     h1 { font-size: 1.3rem; margin: 0 0 2px; }
     .sub { color: #94a3b8; font-size: .8rem; margin-bottom: 16px; }
     a { color: #60a5fa; text-decoration: none; }
-    .date-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+    .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
     select { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px;
-      padding: 8px 12px; font-size: .95rem; font: inherit; }
+      padding: 8px 12px; font-size: .9rem; font: inherit; }
     .summary { color: #94a3b8; font-size: .8rem; }
     .event { background: #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
     .event-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
@@ -1464,9 +1469,13 @@ PHOTO_LOG_PAGE = """
     <h1>📷 撮影ログ</h1>
     <div class="sub"><a href="/dashboard">← ダッシュボードへ戻る</a></div>
 
-    <div class="date-row">
-      <select id="date_sel" onchange="loadDate(this.value)">
+    <div class="filters">
+      <select id="date_sel" onchange="reload()">
         <option>読み込み中...</option>
+      </select>
+      <select id="filter_sel" onchange="reload()">
+        <option value="spray" selected>💦 散水した時のみ</option>
+        <option value="all">全件（見送り・検知のみも含む）</option>
       </select>
       <span class="summary" id="summary"></span>
     </div>
@@ -1486,26 +1495,33 @@ const BADGE = {
   '見送り（カメラ判定）': '<span class="badge badge-reject">🚫 見送り</span>',
   '検知のみ':           '<span class="badge badge-detect">📡 検知のみ</span>',
 };
-async function loadDate(date) {
+let initialized = false;
+async function reload() {
+  const dateSel   = document.getElementById('date_sel');
+  const filterSel = document.getElementById('filter_sel');
+  const date   = initialized ? dateSel.value : '';
+  const filter = filterSel.value;
   document.getElementById('log_body').innerHTML = '<div class="loading">読み込み中...</div>';
   document.getElementById('summary').textContent = '';
   try {
-    const url = '/api/photos/day' + (date ? '?date=' + date : '');
+    let url = '/api/photos/day?filter=' + filter;
+    if (date) url += '&date=' + date;
     const d = await (await fetch(url)).json();
-    // セレクタを更新
-    const sel = document.getElementById('date_sel');
-    const cur = sel.value;
-    sel.innerHTML = d.available_dates.map(dt =>
-      '<option value="' + dt + '"' + (dt === d.date ? ' selected' : '') + '>' + dt + '</option>'
-    ).join('');
-    // サマリ
-    const sprays = d.sets.filter(s => s.kind === '散水あり').length;
-    const rejects = d.sets.filter(s => s.kind.startsWith('見送り')).length;
-    document.getElementById('summary').textContent =
-      d.sets.length + ' 件（散水 ' + sprays + ' 件、見送り ' + rejects + ' 件）';
+    // 日付セレクタの選択肢を初回のみ構築（以降は維持）
+    if (!initialized) {
+      dateSel.innerHTML = d.available_dates.map(dt =>
+        '<option value="' + dt + '"' + (dt === d.date ? ' selected' : '') + '>' + dt + '</option>'
+      ).join('');
+      initialized = true;
+    }
+    // サマリ：件数だけ出す（フィルタ済みの件数）
+    document.getElementById('summary').textContent = d.sets.length + ' 件';
     // ログ本体
     if (!d.sets.length) {
-      document.getElementById('log_body').innerHTML = '<div class="empty">この日の撮影はありません</div>';
+      const msg = filter === 'spray'
+        ? 'この日の散水記録はありません'
+        : 'この日の撮影はありません';
+      document.getElementById('log_body').innerHTML = '<div class="empty">' + msg + '</div>';
       return;
     }
     document.getElementById('log_body').innerHTML = d.sets.map(s => {
@@ -1527,8 +1543,7 @@ async function loadDate(date) {
     document.getElementById('log_body').innerHTML = '<div class="empty">読み込みに失敗しました</div>';
   }
 }
-// 初期ロード：今日の日付でフェッチ（セレクタも一緒に設定される）
-loadDate('');
+reload();
 </script>
 </body>
 </html>
