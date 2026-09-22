@@ -36,7 +36,7 @@ import threading
 from datetime import datetime, timedelta
 from collections import deque
 
-from flask import Flask, jsonify, render_template_string, request, send_from_directory
+from flask import Flask, jsonify, make_response, render_template_string, request, send_from_directory
 from gpiozero import MotionSensor, OutputDevice
 
 try:
@@ -616,6 +616,66 @@ def recent_photo_sets(limit):
             })
             if len(sets) >= limit:
                 return sets
+    return sets
+
+
+def _available_photo_dates():
+    """photos/ にある日付フォルダの一覧（新しい順）。"""
+    try:
+        days = sorted((d for d in os.listdir(PHOTO_DIR)
+                       if os.path.isdir(os.path.join(PHOTO_DIR, d))), reverse=True)
+    except OSError:
+        return []
+    result = []
+    for d in days:
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+            result.append(d)
+        except ValueError:
+            pass
+    return result
+
+
+def day_photo_sets(date_str):
+    """指定日の全撮影（新しい順）。reject も含む。"""
+    sets = []
+    day_dir = os.path.join(PHOTO_DIR, date_str)
+    try:
+        names = os.listdir(day_dir)
+    except OSError:
+        return sets
+    groups = {}
+    for name in names:
+        if not name.endswith(".jpg"):
+            continue
+        stamp, _, kind = name[:-4].partition("_")
+        groups.setdefault(stamp, {})[kind] = f"photos/{date_str}/{name}"
+    for stamp in sorted(groups, reverse=True):
+        try:
+            taken = datetime.strptime(date_str + stamp, "%Y-%m-%d%H%M%S")
+        except ValueError:
+            continue
+        g = groups[stamp]
+        has_spray = "2_spray" in g
+        has_detect = "1_detect" in g
+        has_reject = "0_reject_a" in g or "0_reject_b" in g
+        if not (has_detect or has_spray or has_reject):
+            continue
+        if has_spray:
+            kind_label = "散水あり"
+        elif has_reject:
+            kind_label = "見送り（カメラ判定）"
+        else:
+            kind_label = "検知のみ"
+        sets.append({
+            "time": taken.strftime("%H:%M:%S"),
+            "kind": kind_label,
+            "detect": g.get("1_detect"),
+            "check": g.get("1b_check"),
+            "spray": g.get("2_spray"),
+            "reject_a": g.get("0_reject_a"),
+            "reject_b": g.get("0_reject_b"),
+        })
     return sets
 
 
@@ -1327,6 +1387,269 @@ def photo_file(filename):
     return send_from_directory(PHOTO_DIR, filename, max_age=86400)
 
 
+@app.route("/api/photos/day")
+def api_photos_day():
+    """指定日の全撮影セット。?date=YYYY-MM-DD（省略時は今日）。"""
+    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "invalid date"}), 400
+    return jsonify({
+        "date": date_str,
+        "sets": day_photo_sets(date_str),
+        "available_dates": _available_photo_dates(),
+    })
+
+
+@app.route("/api/camera/frame")
+def api_camera_frame():
+    """現在のカメラフレームをJPEGで返す（ライブビュー用）。"""
+    if not CAMERA_ENABLED or cv2 is None:
+        return "camera not available", 503
+    frame = camera.snapshot()
+    if frame is None:
+        return "no frame", 503
+    code = _ROTATE_CODES.get(CAMERA_ROTATE)
+    if code is not None:
+        frame = cv2.rotate(frame, code)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if not ok:
+        return "encode failed", 503
+    resp = make_response(buf.tobytes())
+    resp.headers["Content-Type"] = "image/jpeg"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+PHOTO_LOG_PAGE = """
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>撮影ログ - 猫撃退システム</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      margin: 0; padding: 20px 14px; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.3rem; margin: 0 0 2px; }
+    .sub { color: #94a3b8; font-size: .8rem; margin-bottom: 16px; }
+    a { color: #60a5fa; text-decoration: none; }
+    .date-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+    select { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px;
+      padding: 8px 12px; font-size: .95rem; font: inherit; }
+    .summary { color: #94a3b8; font-size: .8rem; }
+    .event { background: #1e293b; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+    .event-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    .event-time { font-size: .9rem; font-family: monospace; color: #e2e8f0; }
+    .badge { font-size: .7rem; padding: 2px 8px; border-radius: 10px; font-weight: 700; }
+    .badge-spray  { background: #be185d; color: #fce7f3; }
+    .badge-reject { background: #92400e; color: #fef3c7; }
+    .badge-detect { background: #1d4ed8; color: #dbeafe; }
+    .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+    .shot { position: relative; display: block; aspect-ratio: 16/9; border-radius: 8px;
+      overflow: hidden; background: #0f172a; }
+    .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .shot .tag { position: absolute; left: 5px; bottom: 5px; font-size: .6rem; padding: 2px 5px;
+      border-radius: 4px; background: rgba(15,23,42,.8); color: #e2e8f0; }
+    .empty { color: #64748b; font-size: .85rem; text-align: center; padding: 32px 0; }
+    .loading { color: #64748b; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>📷 撮影ログ</h1>
+    <div class="sub"><a href="/dashboard">← ダッシュボードへ戻る</a></div>
+
+    <div class="date-row">
+      <select id="date_sel" onchange="loadDate(this.value)">
+        <option>読み込み中...</option>
+      </select>
+      <span class="summary" id="summary"></span>
+    </div>
+
+    <div id="log_body"><div class="loading">読み込み中...</div></div>
+  </div>
+
+<script>
+function shotHtml(src, label) {
+  if (!src) return '';
+  return '<a class="shot" href="/' + src + '" target="_blank" rel="noopener">'
+    + '<img src="/' + src + '" alt="' + label + '" loading="lazy">'
+    + '<span class="tag">' + label + '</span></a>';
+}
+const BADGE = {
+  '散水あり':           '<span class="badge badge-spray">💦 散水あり</span>',
+  '見送り（カメラ判定）': '<span class="badge badge-reject">🚫 見送り</span>',
+  '検知のみ':           '<span class="badge badge-detect">📡 検知のみ</span>',
+};
+async function loadDate(date) {
+  document.getElementById('log_body').innerHTML = '<div class="loading">読み込み中...</div>';
+  document.getElementById('summary').textContent = '';
+  try {
+    const url = '/api/photos/day' + (date ? '?date=' + date : '');
+    const d = await (await fetch(url)).json();
+    // セレクタを更新
+    const sel = document.getElementById('date_sel');
+    const cur = sel.value;
+    sel.innerHTML = d.available_dates.map(dt =>
+      '<option value="' + dt + '"' + (dt === d.date ? ' selected' : '') + '>' + dt + '</option>'
+    ).join('');
+    // サマリ
+    const sprays = d.sets.filter(s => s.kind === '散水あり').length;
+    const rejects = d.sets.filter(s => s.kind.startsWith('見送り')).length;
+    document.getElementById('summary').textContent =
+      d.sets.length + ' 件（散水 ' + sprays + ' 件、見送り ' + rejects + ' 件）';
+    // ログ本体
+    if (!d.sets.length) {
+      document.getElementById('log_body').innerHTML = '<div class="empty">この日の撮影はありません</div>';
+      return;
+    }
+    document.getElementById('log_body').innerHTML = d.sets.map(s => {
+      const photos = [
+        shotHtml(s.detect,   '① 検知'),
+        shotHtml(s.check,    '確認フレーム'),
+        shotHtml(s.spray,    '② 散水'),
+        shotHtml(s.reject_a, '見送りA'),
+        shotHtml(s.reject_b, '見送りB'),
+      ].filter(Boolean).join('');
+      return '<div class="event">'
+        + '<div class="event-head">'
+        + '<span class="event-time">' + s.time + '</span>'
+        + (BADGE[s.kind] || '') + '</div>'
+        + '<div class="photos">' + photos + '</div>'
+        + '</div>';
+    }).join('');
+  } catch (e) {
+    document.getElementById('log_body').innerHTML = '<div class="empty">読み込みに失敗しました</div>';
+  }
+}
+// 初期ロード：今日の日付でフェッチ（セレクタも一緒に設定される）
+loadDate('');
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/photo_log")
+def photo_log_page():
+    return PHOTO_LOG_PAGE
+
+
+LIVE_PAGE = """
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ライブビュー - 猫撃退システム</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      margin: 0; padding: 16px 14px; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.2rem; margin: 0 0 2px; }
+    .sub { color: #94a3b8; font-size: .8rem; margin-bottom: 14px; }
+    a { color: #60a5fa; text-decoration: none; }
+    .cam-box { background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 16/9;
+      display: flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+    .cam-box img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .cam-msg { color: #64748b; font-size: .85rem; }
+    .status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+      font-size: .8rem; color: #94a3b8; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80;
+      animation: pulse 1.5s ease-in-out infinite; }
+    .dot.err { background: #f87171; animation: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+    .ts { font-family: monospace; }
+    .btn-spray { width: 100%; padding: 16px; background: #1d4ed8; color: #fff; border: none;
+      border-radius: 12px; font: inherit; font-size: 1rem; font-weight: 700; cursor: pointer; margin-bottom: 8px; }
+    .btn-spray:active { background: #1e40af; }
+    .btn-spray:disabled { opacity: .5; cursor: default; }
+    .spray-msg { font-size: .8rem; color: #94a3b8; text-align: center; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>📹 ライブビュー</h1>
+    <div class="sub"><a href="/dashboard">← ダッシュボードへ戻る</a></div>
+
+    <div class="cam-box">
+      <img id="cam_img" alt="カメラ映像" onerror="onImgError()">
+      <div class="cam-msg" id="cam_msg" style="display:none">カメラ映像を取得中...</div>
+    </div>
+
+    <div class="status-row">
+      <div class="dot" id="dot"></div>
+      <span id="status_txt">接続中...</span>
+      <span class="ts" id="ts_txt"></span>
+    </div>
+
+    <button class="btn-spray" id="spray_btn" onclick="doSpray()">💦 手動散水（テスト噴射）</button>
+    <div class="spray-msg" id="spray_msg"></div>
+  </div>
+
+<script>
+let errCount = 0;
+function refreshFrame() {
+  const img = document.getElementById('cam_img');
+  const ts = Date.now();
+  const newSrc = '/api/camera/frame?t=' + ts;
+  const tmp = new Image();
+  tmp.onload = () => {
+    img.src = newSrc;
+    img.style.display = 'block';
+    document.getElementById('cam_msg').style.display = 'none';
+    document.getElementById('dot').classList.remove('err');
+    document.getElementById('status_txt').textContent = 'ライブ配信中';
+    document.getElementById('ts_txt').textContent = new Date(ts).toLocaleTimeString('ja-JP');
+    errCount = 0;
+  };
+  tmp.onerror = onImgError;
+  tmp.src = newSrc;
+}
+function onImgError() {
+  errCount++;
+  document.getElementById('dot').classList.add('err');
+  document.getElementById('status_txt').textContent = 'カメラ接続待ち... (' + errCount + ')';
+  document.getElementById('ts_txt').textContent = '';
+}
+async function doSpray() {
+  const btn = document.getElementById('spray_btn');
+  const msg = document.getElementById('spray_msg');
+  btn.disabled = true;
+  msg.textContent = '送信中...';
+  try {
+    const r = await fetch('/api/test_pump', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      msg.textContent = '✅ 噴射を開始しました（約5秒）';
+    } else {
+      msg.textContent = '⚠️ ' + (j.reason || '失敗しました');
+    }
+  } catch (e) {
+    msg.textContent = '❌ 通信エラー';
+  }
+  setTimeout(() => { btn.disabled = false; msg.textContent = ''; }, 7000);
+}
+refreshFrame();
+setInterval(refreshFrame, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/live")
+def live_page():
+    return LIVE_PAGE
+
+
 DASHBOARD = """
 <!doctype html>
 <html lang="ja">
@@ -1386,7 +1709,7 @@ DASHBOARD = """
 <body>
   <div class="wrap">
     <h1>📊 猫撃退システム ダッシュボード</h1>
-    <div class="sub"><a href="/">← 操作画面へ戻る</a> ・ <a href="/review">🧪 判定レビュー</a> ・ 10秒ごとに自動更新</div>
+    <div class="sub"><a href="/">← 操作画面へ戻る</a> ・ <a href="/review">🧪 判定レビュー</a> ・ <a href="/photo_log">📷 撮影ログ</a> ・ <a href="/live">📹 ライブビュー</a> ・ 10秒ごとに自動更新</div>
 
     <div class="grid">
       <div class="tile"><div class="label">本日の稼働時間</div><div class="val" id="t_armed">-</div></div>
@@ -1412,7 +1735,7 @@ DASHBOARD = """
     </div>
 
     <div class="section">
-      <h2>📷 直近の撮影</h2>
+      <h2>📷 直近の撮影 <a href="/photo_log" style="font-size:.75rem;font-weight:400;margin-left:8px;">→ 日別全件を見る</a></h2>
       <div id="shots"><div class="muted">読み込み中...</div></div>
     </div>
 
